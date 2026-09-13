@@ -1,0 +1,30 @@
+# Lima template for the Bluefin Server end-to-end installer + boot verification.
+#
+# The macOS GitHub runner has no native KVM, so QEMU cannot boot the real
+# installer image directly. This template enables nested virtualization, which
+# exposes /dev/kvm to the Lima guest, letting qemu-system-x86_64 -enable-kvm run
+# the installer and the installed target disk at near-native speed.
+#
+# The e2e job copies the repository into the guest and runs
+# .github/scripts/lima-e2e-install-boot.sh there, so every build/boot step
+# (BuildStream, podman, QEMU) shares one nested-virt-enabled VM.
+name: bluefin-server-e2e
+cpus: 8
+memory: 8GB
+disk: 100G
+nested: enabled
+containerd:
+  system: false
+  guest: false
+ssh:
+  localShell: true
+provision:
+  - mode: system
+    script: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      apt-get update
+      # qemu-system-x86 (KVM boot), qemu-efi (OVMF), zstd/tar (installer
+      # archive + limactl transfer), just (BuildStream wrapper).
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        qemu-system-x86 ovmf just zstd tar
