@@ -38,8 +38,7 @@ depends:
   # Upstream Flatcar publishes podman, containerd, and docker as systemd-sysext
   # images (projectbluefin/server#127). This replaces the FSDK podman component
   # below with these upstream sysexts, honoring hard rule 4 (no container
-  # runtime in the base DDI). Each element pins the .raw by sha256 and follows
-  # flatcar-zfs.bst: unsquashfs the extension into the image and stage the raw
+  # runtime in the base DDI). Each element pins the .raw by sha256 and stages it
   # under /usr/lib/sysexts so systemd-sysext attaches it on a booted image.
   - flatcar/flatcar-podman.bst
   - flatcar/containerd-flatcar.bst
