@@ -107,7 +107,8 @@ config:
 
       # Configure dynamic linker search paths so ldconfig indexes FSDK libraries
       # (e.g. libc.so.6, libgcc_s.so.1, libkmod.so) for dracut-install
-      printf '/usr/lib/x86_64-linux-gnu\n/usr/lib/x86_64-linux-gnu/systemd\n' > /etc/ld.so.conf
+      # Flatcar ships FSDK libs under /usr/lib64, not the Debian multiarch path.
+      printf '/usr/lib64\n/usr/lib64/systemd\n' > /etc/ld.so.conf
       if [ -d /etc/ld.so.conf.d ]; then
         echo 'include /etc/ld.so.conf.d/*.conf' >> /etc/ld.so.conf
       fi
@@ -115,7 +116,8 @@ config:
 
       # Build target-root linker cache and stage it at /etc/ld.so.cache for dracut
       mkdir -p /target-root/tmp /target-root/etc
-      printf '/usr/lib/x86_64-linux-gnu\n/usr/lib/x86_64-linux-gnu/systemd\n' > /target-root/tmp/ld.so.conf
+      # Flatcar ships FSDK libs under /usr/lib64, not the Debian multiarch path.
+      printf '/usr/lib64\n/usr/lib64/systemd\n' > /target-root/tmp/ld.so.conf
       if [ -d /target-root/etc/ld.so.conf.d ]; then
         echo 'include /etc/ld.so.conf.d/*.conf' >> /target-root/tmp/ld.so.conf
       fi
