@@ -5,8 +5,28 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIMA_TEMPLATE = REPO_ROOT / "files" / "lima" / "bluefin-server-kiosk.yaml"
+E2E_TEMPLATE = REPO_ROOT / ".github" / "scripts" / "bluefin-lima-template.yaml"
 E2E_SCRIPT = REPO_ROOT / "tests" / "e2e" / "test_kubestellar_browser_login.py"
 JUSTFILE = REPO_ROOT / "Justfile"
+
+
+def test_lima_e2e_template_uses_standard_lima_schema() -> None:
+    assert E2E_TEMPLATE.is_file(), f"{E2E_TEMPLATE} must exist"
+    data = yaml.safe_load(E2E_TEMPLATE.read_text(encoding="utf-8"))
+
+    # Extend the canonical Ubuntu 24.04 cloud-image base so `limactl validate`
+    # gets the required `images` and a resolved arch.
+    base = data.get("base", [])
+    assert "template:_images/ubuntu-24.04" in base, (
+        "template must extend base: [template:_images/ubuntu-24.04]"
+    )
+
+    # Expose /dev/kvm to the guest so the e2e script can QEMU-boot with -enable-kvm.
+    assert data.get("nestedVirtualization") is True
+
+    # `ssh.localShell` was rejected by limactl validate; the ssh block must not
+    # carry it.
+    assert "localShell" not in (data.get("ssh") or {})
 
 
 def test_lima_kiosk_template_exists_and_is_valid_yaml() -> None:
