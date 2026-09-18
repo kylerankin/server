@@ -12,7 +12,6 @@
 # Extend the canonical Ubuntu 24.04 cloud-image base so `limactl validate` has
 # the required `images` and a resolved arch, and use the standard Lima schema
 # (`nestedVirtualization`) rather than the removed `nested` field.
-name: bluefin-server-e2e
 base:
   - template:_images/ubuntu-24.04
 cpus: 8
@@ -21,7 +20,7 @@ disk: "100G"
 nestedVirtualization: true
 containerd:
   system: false
-  guest: false
+  user: false
 provision:
   - mode: system
     script: |
