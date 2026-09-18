@@ -23,10 +23,10 @@ variables:
 sources:
   - kind: remote
     url: flatcar:stable/%{flatcar-board}/%{flatcar-version}/flatcar_production_image.vmlinuz
-    ref: %{flatcar-kernel-vmlinuz-sha256}
+    ref: "%{flatcar-kernel-vmlinuz-sha256}"
   - kind: remote
     url: flatcar:stable/%{flatcar-board}/%{flatcar-version}/flatcar-container.tar.gz
-    ref: %{flatcar-kernel-container-sha256}
+    ref: "%{flatcar-kernel-container-sha256}"
   - kind: local
     path: patches/flatcar-kernel
     directory: patches
