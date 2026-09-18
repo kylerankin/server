@@ -129,7 +129,16 @@ refute_log() {
 }
 
 @test "build-ddi os-base=flatcar-reference refuses before the element exists" {
-    run_build "flatcar-reference"
+    # The guard must resolve the element against the project's element-path
+    # (project.conf: element-path: elements), so a stray copy at a bare
+    # oci/ path must not satisfy it. Run against a sandbox that has the
+    # decoy but not elements/oci/, so this stays a refusal test after the
+    # #126 element lands in the repo.
+    touch "${OCI}/bluefin-server-ddi-flatcar-reference.bst"
+    run env PATH="${BIN_DIR}:${PATH}" \
+        just --justfile "${JUSTFILE}" \
+             --working-directory "${SANDBOX}" \
+             build-ddi flatcar-reference
     [ "$status" -ne 0 ]
     [[ "$output" == *"projectbluefin/server#126"* ]]
     assert_no_build

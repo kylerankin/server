@@ -100,7 +100,7 @@ build-ddi OS_BASE="fsdk":
             DDI_ELEMENT="oci/bluefin-server-ddi.bst"
             ;;
         flatcar-reference)
-            if [ ! -f "oci/bluefin-server-ddi-flatcar-reference.bst" ]; then
+            if [ ! -f "elements/oci/bluefin-server-ddi-flatcar-reference.bst" ]; then
                 echo "ERROR: os-base=flatcar-reference requires the imported Flatcar reference tree" >&2
                 echo "       (projectbluefin/server#126); element oci/bluefin-server-ddi-flatcar-reference.bst" >&2
                 echo "       does not exist yet. Add it alongside the #126 tree, then re-run." >&2
