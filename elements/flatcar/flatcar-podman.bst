@@ -14,6 +14,11 @@ description: |
 build-depends:
   - base/base-stack.bst
 
+variables:
+  # Disable the default FSDK strip-commands: this element installs a prebuilt
+  # squashfs blob, and freedesktop-sdk-stripper is not in this sandbox.
+  strip-binaries: ""
+
 sources:
   - kind: remote
     # podman ships flat; containerd/docker ship under rootfs-included-sysexts/.
