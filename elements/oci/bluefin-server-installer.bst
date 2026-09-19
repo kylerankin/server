@@ -117,14 +117,16 @@ config:
       ldconfig
 
       # Build target-root linker cache and stage it at /etc/ld.so.cache for dracut
-      mkdir -p /target-root/tmp /target-root/etc
+      # The conf lives at host /tmp (what ldconfig -f reads below); -r /target-root
+      # makes ldconfig write the cache to /target-root/etc/ld.so.cache instead.
+      mkdir -p /target-root/etc
       # Flatcar ships FSDK libs under /usr/lib64, not the Debian multiarch path.
-      printf '/usr/lib64\n/usr/lib64/systemd\n' > /target-root/tmp/ld.so.conf
+      printf '/usr/lib64\n/usr/lib64/systemd\n' > /tmp/ld.so.conf
       if [ -d /target-root/etc/ld.so.conf.d ]; then
-        echo 'include /etc/ld.so.conf.d/*.conf' >> /target-root/tmp/ld.so.conf
+        echo 'include /etc/ld.so.conf.d/*.conf' >> /tmp/ld.so.conf
       fi
       ldconfig -r /target-root -f /tmp/ld.so.conf
-      rm -f /target-root/tmp/ld.so.conf
+      rm -f /tmp/ld.so.conf
       cp /target-root/etc/ld.so.cache /etc/ld.so.cache
 
       # Run dracut in generic (non-hostonly) mode and explicitly add XFS, VirtIO, and NVMe storage drivers.
