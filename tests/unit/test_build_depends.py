@@ -182,39 +182,37 @@ def test_os_countme_depends_on_curl_and_jq():
 
 
 def test_installer_linker_paths_split_host_and_target():
-    """Installer must index FSDK libs on the host and Flatcar libs in the target.
+    """Target-root ld.so.conf write and read must resolve to the same file.
 
-    projectbluefin/server#132 (hanthor review): the installer/dracut tooling is
-    FSDK/Debian-based, so the *host* ldconfig must index the Debian multiarch
-    path (/usr/lib/x86_64-linux-gnu) while the *target-root* cache must index
-    Flatcar's /usr/lib64. A host cache pointed only at /usr/lib64 would prevent
-    FSDK libraries from resolving during the installer build. The target conf is
-    written to host /tmp and read via `ldconfig -r /target-root -f /tmp/ld.so.conf`
-    so the two paths agree instead of relying on a hidden chroot resolve.
+    projectbluefin/server#132 (hanthor review): `ldconfig -r /target-root` chroots
+    into /target-root, so the `-f /tmp/ld.so.conf` path is resolved *post-chroot* to
+    /target-root/tmp/ld.so.conf. The conf is therefore written to /target-root/tmp/
+    and read back via `-f /tmp/ld.so.conf`; the two must agree, not live on different
+    roots. The target cache indexes Flatcar's /usr/lib64 (the FSDK libs ship there,
+    not the Debian multiarch path).
     """
     installer = ELEMENTS_DIR / "oci" / "bluefin-server-installer.bst"
     text = installer.read_text(encoding="utf-8")
 
-    # Host linker search path (what the host ldconfig indexes). The printf
-    # format uses a literal backslash-n, so match it literally.
-    assert "/usr/lib/x86_64-linux-gnu\\n/usr/lib/x86_64-linux-gnu/systemd\\n" in text, (
-        "installer must index the Debian multiarch path on the host ld.so.conf "
-        "(projectbluefin/server#132)"
-    )
     # Target linker search path (what the target-root cache indexes).
     assert "/usr/lib64\\n/usr/lib64/systemd\\n" in text, (
         "installer must index Flatcar /usr/lib64 for the target-root cache "
         "(projectbluefin/server#132)"
     )
-    # The target conf must not be written under /target-root/tmp and then read
-    # from a different location; both must agree on host /tmp.
-    assert "> /target-root/tmp/ld.so.conf" not in text, (
-        "installer target ld.so.conf must be written to host /tmp, not "
-        "/target-root/tmp, matching the `ldconfig -f /tmp/ld.so.conf` read "
+    # Conf written to /target-root/tmp and read via `-f /tmp/ld.so.conf` under
+    # `-r /target-root` (which resolves to /target-root/tmp/ld.so.conf post-chroot).
+    assert "> /target-root/tmp/ld.so.conf" in text, (
+        "installer must write the target ld.so.conf to /target-root/tmp, matching "
+        "the `ldconfig -r /target-root -f /tmp/ld.so.conf` read "
         "(projectbluefin/server#132)"
     )
     assert "ldconfig -r /target-root -f /tmp/ld.so.conf" in text, (
         "installer must read the target conf from /tmp with `-r /target-root "
+        "(projectbluefin/server#132)"
+    )
+    # Cleanup removes the same post-chroot path it wrote.
+    assert "rm -f /target-root/tmp/ld.so.conf" in text, (
+        "installer must clean up /target-root/tmp/ld.so.conf "
         "(projectbluefin/server#132)"
     )
 
