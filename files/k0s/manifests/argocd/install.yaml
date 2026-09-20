@@ -43,7 +43,7 @@ spec:
       - name: argocd-server
         # pinned by digest so a re-pointed tag cannot silently change what runs
         # (sec-check #74: was mutable tag v2.12.3, EOL with unbackported CVEs)
-        image: quay.io/argoproj/argocd:v2.14.9@sha256:af3dfddcd221c0b9080ff5f76fd36f0208a8e96c08c95764b3a7fbe320ae6bf7
+        image: quay.io/argoproj/argocd:v2.14.9@sha256:f5885af084da62a952e73cf68df355b28af62894e3779ef4da4ed93a717d8f70
         # --insecure serves plaintext HTTP; acceptable only because the Service
         # below is ClusterIP-only and must stay that way. Expose this externally
         # only behind a TLS-terminating proxy, then drop --insecure.
