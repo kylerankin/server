@@ -29,7 +29,7 @@ rules:
     - persistentvolumeclaims
     - serviceaccounts
     - endpoints
-    - limitquotas
+    - limitranges
     - resourcequotas
   verbs: ["get", "list", "watch"]
 - apiGroups: ["apps"]

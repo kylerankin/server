@@ -90,7 +90,7 @@ def test_console_provides_local_and_oauth_login_options() -> None:
     assert "name: ALLOW_DEV_MODE_IN_CLUSTER" in console
     assert "hostPort:" not in console
     # #193: on first boot the console must read the local k0s cluster directly
-    # (no connected kc-agent yet) and skip the sign-in flow.
+    # (no connected kc-agent yet) and skip the onboarding questionnaire.
     assert "name: SKIP_ONBOARDING" in console
     assert "name: NO_LOCAL_AGENT" in console
     assert "name: POD_NAMESPACE" in console

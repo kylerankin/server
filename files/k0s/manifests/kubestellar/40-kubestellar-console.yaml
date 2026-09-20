@@ -53,8 +53,9 @@ spec:
         # no client kc-agent is connected yet, so the console must read the local
         # embedded k0s API directly instead of defaulting to mock/demo cards.
         # NO_LOCAL_AGENT makes the in-cluster backend serve live cluster state
-        # from this pod's ServiceAccount; SKIP_ONBOARDING skips the sign-in flow
-        # so the kiosk shows the dashboard immediately.
+        # from this pod's ServiceAccount (the console forces this on when running
+        # in-cluster regardless); SKIP_ONBOARDING skips the onboarding
+        # questionnaire so the kiosk shows the dashboard immediately.
         - name: SKIP_ONBOARDING
           value: "true"
         - name: NO_LOCAL_AGENT
