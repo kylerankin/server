@@ -92,10 +92,10 @@ build:
 #                     Routes to bluefin-server-ddi-flatcar-reference.bst, added
 #                     alongside the #126 imported Flatcar reference tree.
 [group('installer')]
-build-ddi OS_BASE="fsdk":
+build-ddi $OS_BASE="fsdk":
     #!/usr/bin/env bash
     set -euo pipefail
-    case "{{OS_BASE}}" in
+    case "$OS_BASE" in
         fsdk)
             DDI_ELEMENT="oci/bluefin-server-ddi.bst"
             ;;
@@ -109,7 +109,7 @@ build-ddi OS_BASE="fsdk":
             DDI_ELEMENT="oci/bluefin-server-ddi-flatcar-reference.bst"
             ;;
         *)
-            echo "ERROR: unknown os-base '{{OS_BASE}}' (expected 'fsdk' or 'flatcar-reference')" >&2
+            echo "ERROR: unknown os-base '${OS_BASE}' (expected 'fsdk' or 'flatcar-reference')" >&2
             exit 1
             ;;
     esac

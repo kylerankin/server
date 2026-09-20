@@ -101,7 +101,17 @@ refute_log() {
 # --- guard shape ------------------------------------------------------------
 
 @test "build-ddi still declares the OS_BASE parameter defaulting to fsdk" {
-    grep -qF 'build-ddi OS_BASE="fsdk"' "${JUSTFILE}"
+    grep -qF 'build-ddi $OS_BASE="fsdk"' "${JUSTFILE}"
+}
+
+# `just` substitutes {{...}} textually into the recipe body before bash parses
+# it, so `case "{{OS_BASE}}"` makes `just build-ddi '$(cmd)'` run cmd -- on the
+# rejection path too, because the error message interpolates it a second time.
+# The `$` on the parameter exports it as an environment variable instead, so
+# bash only ever sees "$OS_BASE" and never expands the caller's text.
+@test "build-ddi never interpolates os-base into the recipe body" {
+    run awk '/^build-ddi /{f=1} f&&/\{\{OS_BASE\}\}/{print} f&&/^$/{f=0}' "${JUSTFILE}"
+    [ -z "${output}" ]
 }
 
 @test "build-ddi still validates os-base against fsdk and flatcar-reference" {
@@ -148,5 +158,19 @@ refute_log() {
     run_build "not-a-base"
     [ "$status" -ne 0 ]
     [[ "$output" == *"unknown os-base"* ]]
+    assert_no_build
+}
+
+@test "build-ddi does not execute command substitution in os-base" {
+    # The marker proves execution rather than mere appearance: the payload's
+    # own text necessarily shows up in the rejection message, so a string
+    # assertion could not tell "echoed" from "ran".
+    local marker="${BATS_TEST_TMPDIR}/injected"
+    run_build "\$(touch ${marker})"
+    [ "$status" -ne 0 ]
+    [ ! -e "${marker}" ]
+    # The payload is reported verbatim instead. Before the `$OS_BASE` export
+    # the substitution ran here too, so the name was empty in this message.
+    [[ "$output" == *"touch ${marker}"* ]]
     assert_no_build
 }
