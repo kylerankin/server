@@ -91,6 +91,8 @@ def test_console_provides_local_and_oauth_login_options() -> None:
     assert "hostPort:" not in console
     # #193: on first boot the console must read the local k0s cluster directly
     # (no connected kc-agent yet) and skip the onboarding questionnaire.
+    # SKIP_ONBOARDING skips the questionnaire, not sign-in; sign-in is bypassed
+    # by DEV_MODE/DEV_USER_LOGIN.
     assert "name: SKIP_ONBOARDING" in console
     assert "name: NO_LOCAL_AGENT" in console
     assert "name: POD_NAMESPACE" in console
@@ -143,6 +145,35 @@ def test_console_rbac_reads_only_the_local_cluster() -> None:
         assert set(rule["verbs"]) <= {"get", "list", "watch"}
     resources = {r for rule in role["rules"] for r in rule["resources"]}
     assert {"nodes", "namespaces", "pods"} <= resources
+    # Kubernetes silently ignores resource names that do not exist in the named
+    # apiGroup, so a typo (e.g. "limitquotas") drops the grant with no error.
+    # Pin every name to the real resource for its group.
+    known_resources = {
+        "": {
+            "configmaps",
+            "endpoints",
+            "events",
+            "limitranges",
+            "namespaces",
+            "nodes",
+            "persistentvolumeclaims",
+            "persistentvolumes",
+            "pods",
+            "replicationcontrollers",
+            "resourcequotas",
+            "serviceaccounts",
+            "services",
+        },
+        "apps": {"daemonsets", "deployments", "replicasets", "statefulsets"},
+        "batch": {"cronjobs", "jobs"},
+    }
+    for rule in role["rules"]:
+        for group in rule["apiGroups"]:
+            assert group in known_resources, f"unexpected apiGroup {group!r}"
+            unknown = set(rule["resources"]) - known_resources[group]
+            assert not unknown, f"not real resources in apiGroup {group!r}: {unknown}"
+    # The kiosk dashboard never needs secrets; keep them out of the grant.
+    assert "secrets" not in resources
 
     binding = next(d for d in docs if d["kind"] == "ClusterRoleBinding")
     assert binding["roleRef"]["kind"] == "ClusterRole"

@@ -52,10 +52,12 @@ spec:
         # First-boot fix (#193): on a freshly installed single-node k0s cluster
         # no client kc-agent is connected yet, so the console must read the local
         # embedded k0s API directly instead of defaulting to mock/demo cards.
-        # NO_LOCAL_AGENT makes the in-cluster backend serve live cluster state
-        # from this pod's ServiceAccount (the console forces this on when running
-        # in-cluster regardless); SKIP_ONBOARDING skips the onboarding
-        # questionnaire so the kiosk shows the dashboard immediately.
+        # The fix is the ServiceAccount above plus the read-only ClusterRole in
+        # 42-kubestellar-console-rbac.yaml; NO_LOCAL_AGENT is set only to make
+        # that intent explicit, since the console backend already forces it on
+        # when it detects it is running in-cluster. SKIP_ONBOARDING skips the
+        # onboarding questionnaire so the kiosk shows the dashboard immediately
+        # (sign-in is bypassed separately by DEV_MODE/DEV_USER_LOGIN above).
         - name: SKIP_ONBOARDING
           value: "true"
         - name: NO_LOCAL_AGENT
