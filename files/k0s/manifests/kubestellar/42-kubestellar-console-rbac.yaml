@@ -1,0 +1,62 @@
+# First-boot fix (#193): the console pod reads the local embedded k0s cluster
+# directly (NO_LOCAL_AGENT). It needs read access to render live nodes,
+# namespaces and pods instead of falling back to demo cards. Bound to the
+# console's own ServiceAccount so the default account stays unprivileged.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubestellar-console
+  namespace: kubestellar-console
+  labels:
+    app.kubernetes.io/name: kubestellar-console
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubestellar-console-reader
+  labels:
+    app.kubernetes.io/name: kubestellar-console
+rules:
+- apiGroups: [""]
+  resources:
+    - nodes
+    - namespaces
+    - pods
+    - services
+    - configmaps
+    - events
+    - persistentvolumes
+    - persistentvolumeclaims
+    - serviceaccounts
+    - endpoints
+    - limitquotas
+    - resourcequotas
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources:
+    - deployments
+    - statefulsets
+    - daemonsets
+    - replicasets
+    - replicationcontrollers
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources:
+    - jobs
+    - cronjobs
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubestellar-console-reader
+  labels:
+    app.kubernetes.io/name: kubestellar-console
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubestellar-console-reader
+subjects:
+- kind: ServiceAccount
+  name: kubestellar-console
+  namespace: kubestellar-console
