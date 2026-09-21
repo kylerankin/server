@@ -33,8 +33,8 @@ config:
       # a runtime sysext, so udevd was ordered After=systemd-sysext.service.
       # In Bluefin Server, ZFS is extracted directly into the OS rootfs at build time.
       # Leaving this drop-in causes systemd-udevd to wait for systemd-sysext.service,
-      # which waits for local-fs.target, which waits for var.mount, which waits for
-      # the udev device unit — creating a boot deadlock.
+      # which waits for local-fs.target, which waits for the udev device unit —
+      # creating a boot deadlock.
       rm -rf "%{install-root}/usr/lib/systemd/system/systemd-udevd.service.d"
       if [ -f "%{install-root}/usr/lib/tmpfiles.d/10-zfs.conf" ]; then
         sed -i "/systemd-udevd\.service\.d/d" "%{install-root}/usr/lib/tmpfiles.d/10-zfs.conf"

@@ -7,8 +7,10 @@ description: |
 
   Partition layout:
     10-esp.conf          EFI System Partition (vfat, 500M–1G)
-    20-root-a.conf       Root slot A — DDI filesystem image copied here
-    30-var.conf          /var — xfs, writable, grows to fill disk
+    20-usr-a.conf        Read-only /usr slot A — OS /usr DDI copied here
+    30-usr-b.conf        Read-only /usr slot B — spare, empty (A/B + verity later)
+    40-oem.conf          OEM — ext4, cloud-metadata / Ignition (label OEM)
+    50-root.conf         Writable root — grows to fill disk, seeds k0s sysext
 
 sources:
   - kind: local

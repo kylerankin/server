@@ -352,7 +352,6 @@ test-installer-artifact:
         -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
         -drive if=pflash,format=raw,file="$WORKDIR/ovmf-vars.fd" \
         -nic user,model=virtio-net-pci \
-        -smbios "type=11,value=io.systemd.credential.binary:fstab.extra=L2Rldi9kaXNrL2J5LXBhcnRsYWJlbC92YXIgL3ZhciB4ZnMgZGVmYXVsdHMgMCAwCg==" \
         -smbios "type=11,value=io.systemd.credential.binary:systemd.extra-unit.bluefin-kiosk-ready.service=${READY_UNIT}" \
         -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=console=tty0 console=ttyS0,,115200 systemd.mask=systemd-firstboot.service systemd.mask=systemd-homed-firstboot.service systemd.wants=bluefin-kiosk-ready.service" \
         -nographic \

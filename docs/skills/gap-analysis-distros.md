@@ -95,7 +95,7 @@ Bluefin Server is a BuildStream 2-based, image-based Linux server OS built from 
 | Axis | Bluefin Server (as-implemented) |
 |------|---------------------------------|
 | **Philosophy** | Systemd-native, minimal, image-based server OS appliance; base DDI includes bash for login and bring-up while heavy developer/debug tools live in sysexts or system containers; intended to run container workloads and Kubernetes via optional sysexts. Sources: [AGENTS.md](../../AGENTS.md), [factory-integration.md](factory-integration.md). |
-| **State model** | Target OS DDI is an XFS filesystem image. A separate persistent `/var` partition is created by the installer. There is no second root slot provisioned today, and the UKI cmdline currently uses `rw`, so the root is not mounted read-only at runtime. Sources: [bluefin-server-ddi.bst](../../elements/oci/bluefin-server-ddi.bst), [20-root-a.conf](../../files/installer/repart.d/20-root-a.conf), [bluefin-server-installer.bst](../../elements/oci/bluefin-server-installer.bst). |
+| **State model** | Target OS DDI is an XFS filesystem image copied into the read-only USR-A slot (issue #134). `/var` lives on the writable ROOT slot; USR-B is a spare /usr slot. The UKI boots with `mount.usr=PARTLABEL=USR-A`, so `/usr` is mounted read-only at runtime. Sources: [bluefin-server-ddi.bst](../../elements/oci/bluefin-server-ddi.bst), [20-usr-a.conf](../../files/installer/repart.d/20-usr-a.conf), [bluefin-server-installer.bst](../../elements/oci/bluefin-server-installer.bst). |
 | **Updates** | `systemd-sysupdate` reads root/UKI transfers from `files/os/sysupdate.d/` and the optional k0s transfer from the `k0s` component directory. Assets are published to GitHub Releases, and the combined `SHA256SUMS` manifest is signed in CI with a GPG key. `Verify=yes` is the default. Sources: [systemd-sysupdate-verification.md](systemd-sysupdate-verification.md), [50-root.transfer](../../files/os/sysupdate.d/50-root.transfer), [60-uki.transfer](../../files/os/sysupdate.d/60-uki.transfer), [70-k0s.transfer](../../files/os/sysupdate.k0s.d/70-k0s.transfer), also `systemd-sysupdate(8)`. |
 | **Provisioning** | The installer is an offline `systemd-sysinstall` image that embeds the DDI as a data partition. First-boot configuration is intended to be delivered via `systemd-creds` through the ESP or hypervisor metadata. Today only `passwd.hashed-password.root` is consumed via `systemd-sysusers.d`; the documented `tmpfiles.extra` path for SSH keys and similar files is not implemented. Sources: [bluefin-server-installer.bst](../../elements/oci/bluefin-server-installer.bst), [10-root-creds.conf](../../files/os/sysusers.d/10-root-creds.conf), [os-creds-prov.bst](../../elements/bluefin-server/os-creds-prov.bst), [systemd-creds(1)](https://www.freedesktop.org/software/systemd/man/latest/systemd-creds.html). |
 | **Customization** | Adds software through `systemd-sysext` (overlay `/usr`) and `systemd-confext` (overlay `/etc`) images. The base OS `os-release` advertises `ID=flatcar` and a matching `VERSION_ID` so pre-built Flatcar Bakery extensions load. k0s is shipped as a separately built, optionally enabled sysext. Sources: [systemd-sysext-extensions.md](systemd-sysext-extensions.md), [k0s-sysext.md](k0s-sysext.md), [os-release-flatcar.bst](../../elements/bluefin-server/os-release-flatcar.bst), [systemd-sysext(8)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sysext.html). |
@@ -105,9 +105,8 @@ Bluefin Server is a BuildStream 2-based, image-based Linux server OS built from 
 
 ### Root filesystem and A/B rollback
 
-- **Gap:** Bluefin's `systemd-sysupdate` root transfer already names two target partitions (`root-a` and `root-b`) in `50-root.transfer`, but the installer only creates one root partition (`20-root-a.conf`).
-  There is no `root-b` partition yet, so `systemd-sysupdate` cannot stage an update into an inactive slot and the OS has no atomic rollback path comparable to Flatcar/Fedora CoreOS/Talos today.
-- **Gap:** The DDI filesystem is created as a writable XFS image and the installed UKI boots it with `rw`. A read-only `/usr` state model, as intended by the sysext-first design, is not enforced at runtime.
+- **Gap:** `systemd-sysupdate` root transfer now targets the single writable ROOT slot (`50-root.transfer`, `MatchPattern=ROOT`). Atomic A/B rollback for `/usr` is provided by the USR-A/USR-B pair (issue #134), but USR-B is left empty and unverity'd until the /usr DDI ticket stages verity into it; until then there is no active rollback path comparable to Flatcar/Fedora CoreOS/Talos.
+- **Gap:** The read-only `/usr` state model, as intended by the sysext-first design, is now enforced at runtime (`USR-A` mounted read-only via `mount.usr=PARTLABEL=USR-A`, issue #134).
 - **Gap:** There is no mechanism to select the previous OS version at boot if an update fails; recovery currently depends on reinstalling from media.
 
 ### Provisioning
@@ -119,12 +118,12 @@ Bluefin Server is a BuildStream 2-based, image-based Linux server OS built from 
 
 ### Update delivery
 
-- **Gap:** The root transfer uses `Type=partition Path=auto`, which requires `systemd-sysupdate` to discover a matching GPT partition label (`bluefin-server-root-a`/`root-b`). This is correct, but without a `root-b` partition the transfer effectively overwrites the running root in place.
+- **Gap:** The root transfer uses `Type=partition Path=auto` with `MatchPattern=ROOT`, which matches the single writable ROOT slot (issue #134). Because ROOT is a single slot, an update overwrites the running root in place; atomic rollback now lives in the /usr USR-A/USR-B pair once the /usr DDI stages verity into it.
 - **Gap:** `systemd-sysupdate-reboot.service`/`systemd-sysupdate-reboot.timer` are not enabled or configured; the only reboot signal today is the Kured hook.
 
 ### Customization
 
-- **No major gap found relative to the design intent.** `systemd-sysext` and Flatcar Bakery compatibility match the intended extension model. The main operational concern is that, because `/usr` is not mounted read-only, a sysext merge vs. runtime writes to `/usr` have different guarantees than on Flatcar or Fedora CoreOS.
+- **No major gap found relative to the design intent.** `systemd-sysext` and Flatcar Bakery compatibility match the intended extension model. `/usr` is now mounted read-only at runtime (`USR-A`, issue #134), so sysext merges and runtime writes to `/usr` have the same guarantees as on Flatcar or Fedora CoreOS.
 
 ### Reboot coordination
 
@@ -189,7 +188,7 @@ These gaps drive the priorities in [architecture-roadmap.md](architecture-roadma
 - [elements/bluefin-server/os-release-flatcar.bst](../../elements/bluefin-server/os-release-flatcar.bst)
 - [elements/bluefin-server/os-creds-prov.bst](../../elements/bluefin-server/os-creds-prov.bst)
 - [elements/bluefin-server/os-kured-hook.bst](../../elements/bluefin-server/os-kured-hook.bst)
-- [files/installer/repart.d/20-root-a.conf](../../files/installer/repart.d/20-root-a.conf)
+- [files/installer/repart.d/20-usr-a.conf](../../files/installer/repart.d/20-usr-a.conf)
 - [files/os/sysupdate.d/50-root.transfer](../../files/os/sysupdate.d/50-root.transfer)
 - [files/os/sysupdate.d/60-uki.transfer](../../files/os/sysupdate.d/60-uki.transfer)
 - [files/os/sysupdate.k0s.d/70-k0s.transfer](../../files/os/sysupdate.k0s.d/70-k0s.transfer)

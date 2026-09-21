@@ -20,15 +20,15 @@ This audit tracks the gap between the current tree and a first public/usable MVP
 | Release path exists | ✅ | `.github/workflows/build.yml` builds, signs, uploads to GitHub Release |
 | Cluster build pipeline | ✅ | Phase A complete; pipeline builds DDI, installer, and k0s sysext with uutils |
 | Automated boot test | 🔄 | Phase B in progress for Alpha; `bluefin-server-boot-test` workflow running on lab cluster |
-| A/B root rollback | ❌ | `50-root.transfer` names `root-a`/`root-b`, installer only creates `root-a` |
-| Root immutability | ❌ | DDI boots read/write (`rw` on cmdline) |
+| A/B /usr rollback | ❌ | `50-root.transfer` now targets the single writable ROOT slot; USR-B is a spare /usr slot but is empty and unverity'd until the /usr DDI ticket stages verity into it |
+| Root immutability | 🔄 | `/usr` is mounted read-only at runtime (`mount.usr=PARTLABEL=USR-A`, issue #134); the UKI cmdline still boots `rw` and is deferred to Phase C |
 | First-boot SSH keys | ❌ | Only root password credential path exists |
 
 Competitor context: [gap-analysis-distros.md](skills/gap-analysis-distros.md)
 
 ## Verdict
 
-**Alpha state — in progress for MVP 1.0.** Phase A (build path, uutils, k0s sysext, validate) is complete. Phase B (automated boot test on lab cluster) is actively in progress for the Alpha milestone. Full MVP 1.0 release requires concluding Phase B boot verification and Phase C runtime hardening (automated rollback, read-only `/usr`, credential delivery).
+**Alpha state — in progress for MVP 1.0.** Phase A (build path, uutils, k0s sysext, validate) is complete. Phase B (automated boot test on lab cluster) is actively in progress for the Alpha milestone. Full MVP 1.0 release requires concluding Phase B boot verification and Phase C runtime hardening (automated `/usr` rollback and credential delivery).
 
 ## Roadmap
 
@@ -51,8 +51,8 @@ Priority order. Each item depends on the ones above it.
 
 ### Phase C: update/rollback and provisioning
 
-- [ ] Add `root-b` to installer repart recipes and verify `systemd-sysupdate` stages into the inactive slot.
-- [ ] Switch UKI cmdline from `rw` to `ro` and rely on `/var` for mutable state.
+- [ ] Stage the /usr DDI into USR-A, populate USR-B as a verity-protected spare, and verify `systemd-sysupdate` stages into the inactive /usr slot.
+- [ ] Switch UKI cmdline from `rw` to `ro`; mutable state now lives on the writable ROOT slot (`/var`, `/etc`, `/home`).
 - [ ] Consume `systemd-creds` for SSH authorized keys and static network config.
 - [ ] Add boot menu entry to select the previous slot after a failed update.
 
