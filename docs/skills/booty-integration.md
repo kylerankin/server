@@ -42,6 +42,15 @@ present, applies it through a `config.replace` stub (see
 SSH keys (which also enable `sshd.service`, disabled by preset in the image),
 state disk, extensions (any of `zfs`, `kubestellar`, `k0s`), and a k0s token.
 
+The config is fetched over https only — a plain `http://` boot origin is
+refused — and if Booty publishes a detached signature (`bluefin-node.ign.gpg`)
+it is verified with `gpgv` against the import keyring (the same root as the
+image pull) before the verified bytes are staged inline at
+`/run/ignition/user.ign`. Until Booty signs per-MAC configs, an https server
+without a `.gpg` still stages the config, flagged unauthenticated; refusing
+unsigned https configs is the intended fail-closed end-state and waits on that
+Booty-side signing change (issue #284).
+
 ## Install to disk
 
 Setting `doInstall` in the node's Booty config boots it into

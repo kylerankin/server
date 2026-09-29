@@ -139,6 +139,14 @@ Stages wired into the initrd (`files/initrd-ignition/`), in order:
 `kargs` stage is not wired, so `kernelArguments` is silently not applied: the
 command line is sealed in the signed UKI.
 
+The config is fetched over https only — a plain `http://` origin is refused —
+and if the boot server publishes a detached signature (`bluefin-node.ign.gpg`)
+it is verified with `gpgv` against the import keyring before the verified bytes
+are staged inline at `/run/ignition/user.ign`. Until Booty signs per-MAC
+configs, an https server without a `.gpg` still stages the config,
+flagged unauthenticated; refusing unsigned https configs is the intended
+fail-closed end-state, gated on that Booty-side signing change (issue #284).
+
 | Config section | Supported |
 |---|---|
 | `ignition.config.merge` / `replace`, `timeouts`, `security.tls` | Yes |
