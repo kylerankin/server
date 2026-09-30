@@ -168,7 +168,7 @@ def run(
     env = dict(os.environ, BLUEFIN_IGNITION_OUT=str(out / "user.ign"), CURL_CA_BUNDLE=str(tmp_path / "cert.pem"))
     env.pop("CREDENTIALS_DIRECTORY", None)
     if keyring is not None:
-        env["BLUEFIN_KEYRING"] = str(keyring)
+        env["BLUEFIN_IMPORT_KEYRING"] = str(keyring)
     if creds:
         cred_dir = tmp_path / "creds"
         cred_dir.mkdir(exist_ok=True)
