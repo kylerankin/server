@@ -4,7 +4,7 @@ description: How Booty serves Bluefin Server releases to nodes. Load when workin
 metadata:
   type: reference
   status: stable
-  last_updated: "2026-09-29"
+  last_updated: "2026-09-30"
 ---
 # Booty Integration
 
@@ -50,22 +50,39 @@ only if it is signed:
   root as the image pull), then stages the verified bytes inline at
   `/run/ignition/user.ign`, so Ignition applies exactly what was signed. The
   signature is the gate, not the transport: plain `http://` works, as it does
-  for the `/usr` pull.
-- Only an HTTP 404 on the `.gpg` counts as "unsigned", and an unsigned config
-  is applied only with the system credential `bluefin.ignition.allow-unsigned`
-  (any non-empty value), a trust-the-network opt-out that costs nothing
-  extra: whoever can set it can already set `ignition.config`. Any other
-  failure fetching the `.gpg` (5xx, timeout, dropped connection), or a
-  signature that does not verify, fails the boot into emergency mode
-  (`bluefin-ignition-credentials.service` has `OnFailure=emergency.target`).
+  for the `/usr` pull. A keyring that cannot be read (say, a dangling `/etc`
+  symlink) fails the boot; the other one is never tried instead.
+- Only an HTTP 404 on the `.gpg` counts as "unsigned". An unsigned config is
+  applied only with the system credential `bluefin.ignition.allow-unsigned`
+  (any non-empty value), and is logged as `UNAUTHENTICATED`. Any other failure
+  fetching the `.gpg` (5xx, timeout, dropped connection), or a signature that
+  does not verify, fails the boot into emergency mode with or without the
+  credential (`bluefin-ignition-credentials.service` has
+  `OnFailure=emergency.target`); the unit's journal carries `gpgv`'s reason.
 - A signed config must be self-contained. Ignition fetches
   `ignition.config.merge` / `replace` targets and remote
   `storage.files[].contents.source` URLs without checking them against any
   signature, so each such source needs a `verification.hash`.
 
-Booty signing per-MAC configs is tracked in issue #284. Until it does,
-plain-network Booty deployments that serve `bluefin-node.ign` need the
-opt-out credential, or they stop at emergency mode.
+### Transitional: unsigned configs on netboot
+
+Booty does not sign `bluefin-node.ign` yet; it answers 404 for the `.gpg`. A
+UEFI HTTP Boot node with Secure Boot has no other way to receive the opt-out
+credential: the signed UKI's own command line wins, there is no ESP for
+`/loader/credentials`, and real firmware sets no SMBIOS type 11 strings. So
+the netboot UKI carries it on its command line,
+`systemd.set_credential=bluefin.ignition.allow-unsigned:1` (`netboot-cmdline`
+in `elements/oci/bluefin-server-boot.bst`); the disk and installer UKIs do
+not. Booty's iPXE chainload and BIOS paths boot with the UKI's own `.cmdline`,
+rewriting only the `rd.systemd.pull` URL, so they carry it too.
+
+Booty-provisioned nodes keep applying their per-node config, and a bad
+signature or a `.gpg` failure other than 404 still fails closed. This is not
+yet protection against an on-path attacker, who can answer 404 for the `.gpg`
+to force the unsigned path. The default goes away once Booty signs each
+node's config with a dedicated config key, trusted in the initrd separately
+from the release key that signs `SHA256SUMS`
+([#327](https://github.com/projectbluefin/server/issues/327), following #284).
 
 ## Install to disk
 
