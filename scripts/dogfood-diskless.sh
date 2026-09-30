@@ -27,8 +27,8 @@
 #                              /usr image URL from the boot URL); enrolls keys first
 #   DOGFOOD_BOOT_URL=<url>     HTTP boot from another server (e.g. Booty) instead
 #   DOGFOOD_NODE_IGN=<file>    serve it, unsigned, as bluefin-node.ign next to the UKI
-#                              (HTTP boot), with the bluefin.ignition.allow-unsigned
-#                              credential: the boot test holds no signing key
+#                              (HTTP boot); the netboot UKI's transitional
+#                              bluefin.ignition.allow-unsigned default accepts it
 #   DOGFOOD_SERVE_EXTRA=<dir>  also serve the files in <dir>
 #   DOGFOOD_TAMPER=raw|sums    serve a corrupted image (raw), or a corrupted image with
 #                              SHA256SUMS re-hashed to match it but no longer matching
@@ -161,10 +161,6 @@ if [ -n "${DOGFOOD_STATE_DISK:-}" ]; then
 fi
 if [ -n "${DOGFOOD_IGNITION:-}" ]; then
     qemu+=(-smbios "$(cred ignition.config "${DOGFOOD_IGNITION}")")
-fi
-if [ -n "${DOGFOOD_NODE_IGN:-}" ]; then
-    printf '1' > "${work}/allow-unsigned"
-    qemu+=(-smbios "$(cred bluefin.ignition.allow-unsigned "${work}/allow-unsigned")")
 fi
 tamper="${DOGFOOD_TAMPER:-}"
 if [ -n "${tamper}" ]; then

@@ -7,8 +7,9 @@ node config used to be applied with no signature: an on-path attacker on the
 chain. The signature is now the gate, whatever the transport: a config next to
 the UKI is applied only if bluefin-node.ign.gpg verifies against the import
 keyring, or, unsigned (the .gpg is a 404, nothing else), with the
-bluefin.ignition.allow-unsigned credential. Runs against local HTTP and HTTPS
-servers and throwaway GnuPG keys; no files/boot-keys are needed.
+bluefin.ignition.allow-unsigned credential, which the netboot UKI sets until
+Booty signs configs (projectbluefin/server#327). Runs against local HTTP and
+HTTPS servers and throwaway GnuPG keys; no files/boot-keys are needed.
 """
 
 from __future__ import annotations
@@ -26,7 +27,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "files" / "initrd-ignition" / "usr" / "libexec" / "bluefin-ignition-credentials"
+UNIT = ROOT / "files" / "initrd-ignition" / "usr" / "lib" / "systemd" / "system" / "bluefin-ignition-credentials.service"
 ELEMENTS = ROOT / "elements" / "bluefin-server" / "initrd"
+BOOT = ROOT / "elements" / "oci" / "bluefin-server-boot.bst"
 needs_tools = pytest.mark.skipif(
     not all(shutil.which(t) for t in ("curl", "gpg", "gpgv", "openssl")),
     reason="needs curl, gpg, gpgv and openssl",
@@ -355,6 +358,21 @@ def test_the_etc_keyring_overrides_the_image_one_without_falling_back(
         assert contents is None
         assert f"import keyring {chosen} is missing or unreadable" in log
 
+
+def test_only_the_netboot_uki_accepts_an_unsigned_node_config_by_default() -> None:
+    # Transitional until Booty signs per-node configs (#327): UEFI HTTP Boot
+    # with Secure Boot cannot pass the opt-out except on the UKI's own
+    # command line. Installed and installer boots never get it.
+    import yaml
+
+    text = BOOT.read_text(encoding="utf-8")
+    variables = yaml.safe_load(text)["variables"]
+    assert "systemd.set_credential=bluefin.ignition.allow-unsigned:1" in variables["netboot-cmdline"].split()
+    for name in ("common-cmdline", "disk-cmdline", "installer-cmdline"):
+        assert "bluefin.ignition.allow-unsigned" not in variables[name], name
+    assert text.count("%{netboot-cmdline}") == 1
+    assert 'uki bluefin-server-netboot_%{image-version} "%{netboot-cmdline}"' in text
+    assert "ImportCredential=bluefin.ignition.allow-unsigned" in UNIT.read_text(encoding="utf-8").splitlines()
 
 
 @needs_tools
