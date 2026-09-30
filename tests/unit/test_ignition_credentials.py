@@ -32,6 +32,23 @@ needs_tools = pytest.mark.skipif(
     reason="needs curl, gpg, gpgv and openssl",
 )
 
+# The script picks its keyring from fixed paths; a private user and mount
+# namespace lets a test put its own keyrings there.
+KEYRING_DIRS = ("/etc/systemd", "/usr/lib/systemd")
+
+
+def _can_bind_keyring_dirs() -> bool:
+    if not shutil.which("unshare") or not all(os.path.isdir(d) for d in KEYRING_DIRS):
+        return False
+    mounts = " && ".join(f"mount -t tmpfs none {d}" for d in KEYRING_DIRS)
+    probe = subprocess.run(
+        ["unshare", "--user", "--map-root-user", "--mount", "sh", "-c", mounts], capture_output=True
+    )
+    return probe.returncode == 0
+
+
+needs_mount_ns = pytest.mark.skipif(not _can_bind_keyring_dirs(), reason="needs unprivileged user and mount namespaces")
+
 CONFIG = """\
 {"ignition":{"version":"3.6.0"},"systemd":{"units":[{"name":"x.service","enabled":true,"contents":"[Unit]\\n[Service]\\nExecStart=/bin/true\\n[Install]\\nWantedBy=multi-user.target\\n"}]}}
 """
@@ -49,6 +66,9 @@ def test_ships_in_the_initrd_stack_and_is_executable_bash() -> None:
     assert SCRIPT.stat().st_mode & stat.S_IXUSR
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
 
+
+def test_the_script_is_shellcheck_clean(shellcheck: str) -> None:
+    subprocess.run([shellcheck, "-S", "style", str(SCRIPT)], check=True)
 
 
 @pytest.fixture(scope="module")
@@ -160,13 +180,16 @@ def run(
     origin_url: str | None = None,
     creds: dict[str, str] | None = None,
     keyring: Path | None = None,
+    keyring_dirs: tuple[Path, Path] | None = None,
 ) -> tuple[int, str, str | None]:
     """Run bluefin-ignition-credentials. Returns (returncode, combined output,
-    the staged user.ign contents or None if nothing was staged)."""
+    the staged user.ign contents or None if nothing was staged). keyring_dirs
+    are bound over KEYRING_DIRS in a private mount namespace."""
     out = tmp_path / "run" / "ignition"
     out.mkdir(parents=True)
     env = dict(os.environ, BLUEFIN_IGNITION_OUT=str(out / "user.ign"), CURL_CA_BUNDLE=str(tmp_path / "cert.pem"))
     env.pop("CREDENTIALS_DIRECTORY", None)
+    env.pop("BLUEFIN_IMPORT_KEYRING", None)
     if keyring is not None:
         env["BLUEFIN_IMPORT_KEYRING"] = str(keyring)
     if creds:
@@ -182,7 +205,12 @@ def run(
         bo.write_text(f'#!/usr/bin/bash\nprintf "%s\\n" "{origin_url}"\n', encoding="utf-8")
         bo.chmod(0o755)
         env["BLUEFIN_BOOT_ORIGIN"] = str(bo)
-    result = subprocess.run([str(SCRIPT)], capture_output=True, text=True, env=env, timeout=120)
+    cmd = [str(SCRIPT)]
+    if keyring_dirs is not None:
+        binds = " && ".join(f'mount --bind "${i + 1}" {d}' for i, d in enumerate(KEYRING_DIRS))
+        cmd = ["unshare", "--user", "--map-root-user", "--mount", "sh", "-c", f'{binds} && exec "$3"',
+               "sh", *map(str, keyring_dirs), str(SCRIPT)]
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
     user_ign = out / "user.ign"
     contents = user_ign.read_text(encoding="utf-8") if user_ign.exists() else None
     return result.returncode, result.stdout + result.stderr, contents
@@ -199,7 +227,8 @@ def test_signed_config_over_plain_http_is_staged_verbatim(tmp_path: Path, origin
     rc, log, contents = run(tmp_path, origin_url=url + UKI, keyring=keys["release-ring"])
     assert rc == 0, log
     assert contents == CONFIG, "the verified bytes are staged, not re-fetched"
-    assert "gpgv-verified" in log
+    assert f"gpgv-verified against {keys['release-ring']}" in log
+    assert 'gpgv: Good signature from "release' in log, "gpgv's report reaches the journal"
 
 
 @needs_tools
@@ -221,8 +250,11 @@ def test_http_origin_without_a_config_boots_with_nothing_to_apply(tmp_path: Path
 
 
 @needs_tools
-@pytest.mark.parametrize("damage", ["other-key", "config-changed", "signature-truncated"])
-def test_a_signature_that_does_not_verify_is_refused(tmp_path: Path, origin, keys, damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage,reason",
+    [("other-key", "No public key"), ("config-changed", "BAD signature"), ("signature-truncated", "gpgv: ")],
+)
+def test_a_signature_that_does_not_verify_is_refused(tmp_path: Path, origin, keys, damage: str, reason: str) -> None:
     url, srv, _ = origin
     _publish(srv, sign_key=keys["stranger" if damage == "other-key" else "release"])
     if damage == "config-changed":
@@ -234,6 +266,7 @@ def test_a_signature_that_does_not_verify_is_refused(tmp_path: Path, origin, key
     assert rc == 1, log
     assert contents is None
     assert "does not verify" in log
+    assert reason in log, "the journal says why gpgv refused"
 
 
 @needs_tools
@@ -269,13 +302,59 @@ def test_a_signature_that_cannot_be_fetched_is_not_a_missing_one(tmp_path: Path,
 
 
 @needs_tools
-def test_an_unreadable_keyring_refuses_a_signed_config(tmp_path: Path, origin, keys) -> None:
+@pytest.mark.parametrize("kind", ["missing", "dangling-symlink", "directory"])
+def test_an_unreadable_keyring_refuses_a_signed_config(tmp_path: Path, origin, keys, kind: str) -> None:
     url, srv, _ = origin
     _publish(srv, sign_key=keys["release"])
-    rc, log, contents = run(tmp_path, origin_url=url + UKI, keyring=tmp_path / "missing.pgp")
+    ring = tmp_path / "import-pubring.pgp"
+    if kind == "dangling-symlink":
+        ring.symlink_to(tmp_path / "gone.pgp")
+    if kind == "directory":
+        ring.mkdir()
+    rc, log, contents = run(tmp_path, origin_url=url + UKI, keyring=ring)
     assert rc == 1, log
     assert contents is None
-    assert "not readable" in log
+    assert f"import keyring {ring} is missing or unreadable" in log
+    assert "gpgv:" not in log, "no other keyring is tried"
+
+
+@needs_tools
+@needs_mount_ns
+@pytest.mark.parametrize(
+    "override,vendor,chosen,ok",
+    [
+        (None, "release", "/usr/lib/systemd/import-pubring.pgp", True),
+        ("release", "stranger", "/etc/systemd/import-pubring.pgp", True),
+        ("dangling", "release", "/etc/systemd/import-pubring.pgp", False),
+    ],
+)
+def test_the_etc_keyring_overrides_the_image_one_without_falling_back(
+    tmp_path: Path, origin, keys, override: str | None, vendor: str, chosen: str, ok: bool
+) -> None:
+    # Without BLUEFIN_IMPORT_KEYRING the script trusts what systemd-importd
+    # does: /etc/systemd/import-pubring.pgp when present, else the image's.
+    # A broken override fails the boot even though the image keyring would
+    # have verified the config.
+    url, srv, _ = origin
+    _publish(srv, sign_key=keys["release"])
+    etc, usr = tmp_path / "etc-systemd", tmp_path / "usr-lib-systemd"
+    etc.mkdir()
+    usr.mkdir()
+    shutil.copy(keys[f"{vendor}-ring"], usr / "import-pubring.pgp")
+    if override == "release":
+        shutil.copy(keys["release-ring"], etc / "import-pubring.pgp")
+    if override == "dangling":
+        (etc / "import-pubring.pgp").symlink_to(tmp_path / "gone.pgp")
+    rc, log, contents = run(tmp_path, origin_url=url + UKI, keyring_dirs=(etc, usr))
+    if ok:
+        assert rc == 0, log
+        assert contents == CONFIG
+        assert f"gpgv-verified against {chosen}" in log
+    else:
+        assert rc == 1, log
+        assert contents is None
+        assert f"import keyring {chosen} is missing or unreadable" in log
+
 
 
 @needs_tools
