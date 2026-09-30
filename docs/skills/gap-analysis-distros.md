@@ -6,7 +6,7 @@ description: |
 metadata:
   type: reference
   status: stable
-  last_updated: "2026-09-07"
+  last_updated: "2026-09-29"
 ---
 # Gap Analysis: Bluefin Server versus Comparable Server OSes
 
@@ -90,51 +90,56 @@ facts about Bluefin Server are drawn from source files in this repository.
 
 ## 3. Bluefin Server Current Implementation
 
-Bluefin Server is a BuildStream 2-based, image-based Linux server OS built from FSDK components.
+Bluefin Server is a BuildStream 2-based, image-based Linux server OS composed
+entirely from freedesktop-sdk (FSDK) 26.08 components (systemd v261, FSDK
+kernel). No other distribution's binaries ship in the image.
 
 | Axis | Bluefin Server (as-implemented) |
 |------|---------------------------------|
-| **Philosophy** | Systemd-native, minimal, image-based server OS appliance; base DDI includes bash for login and bring-up while heavy developer/debug tools live in sysexts or system containers; intended to run container workloads and Kubernetes via optional sysexts. Sources: [AGENTS.md](../../AGENTS.md), [factory-integration.md](factory-integration.md). |
-| **State model** | Target OS DDI is an XFS filesystem image. A separate persistent `/var` partition is created by the installer. There is no second root slot provisioned today, and the UKI cmdline currently uses `rw`, so the root is not mounted read-only at runtime. Sources: [bluefin-server-ddi.bst](../../elements/oci/bluefin-server-ddi.bst), [20-root-a.conf](../../files/installer/repart.d/20-root-a.conf), [bluefin-server-installer.bst](../../elements/oci/bluefin-server-installer.bst). |
-| **Updates** | `systemd-sysupdate` reads root/UKI transfers from `files/os/sysupdate.d/` and the optional k0s transfer from the `k0s` component directory. Assets are published to GitHub Releases, and the combined `SHA256SUMS` manifest is signed in CI with a GPG key. `Verify=yes` is the default. Sources: [systemd-sysupdate-verification.md](systemd-sysupdate-verification.md), [50-root.transfer](../../files/os/sysupdate.d/50-root.transfer), [60-uki.transfer](../../files/os/sysupdate.d/60-uki.transfer), [70-k0s.transfer](../../files/os/sysupdate.k0s.d/70-k0s.transfer), also `systemd-sysupdate(8)`. |
-| **Provisioning** | The installer is an offline `systemd-sysinstall` image that embeds the DDI as a data partition. First-boot configuration is intended to be delivered via `systemd-creds` through the ESP or hypervisor metadata. Today only `passwd.hashed-password.root` is consumed via `systemd-sysusers.d`; the documented `tmpfiles.extra` path for SSH keys and similar files is not implemented. Sources: [bluefin-server-installer.bst](../../elements/oci/bluefin-server-installer.bst), [10-root-creds.conf](../../files/os/sysusers.d/10-root-creds.conf), [os-creds-prov.bst](../../elements/bluefin-server/os-creds-prov.bst), [systemd-creds(1)](https://www.freedesktop.org/software/systemd/man/latest/systemd-creds.html). |
-| **Customization** | Adds software through `systemd-sysext` (overlay `/usr`) and `systemd-confext` (overlay `/etc`) images. The base OS `os-release` advertises `ID=flatcar` and a matching `VERSION_ID` so pre-built Flatcar Bakery extensions load. k0s is shipped as a separately built, optionally enabled sysext. Sources: [systemd-sysext-extensions.md](systemd-sysext-extensions.md), [k0s-sysext.md](k0s-sysext.md), [os-release-flatcar.bst](../../elements/bluefin-server/os-release-flatcar.bst), [systemd-sysext(8)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sysext.html). |
-| **Reboot coordination** | `systemd-sysupdate.service` has an `ExecStartPost` that touches `/run/reboot-required`. Rolling reboots across Kubernetes nodes rely on Kured reading that file. Sources: [os-kured-hook.bst](../../elements/bluefin-server/os-kured-hook.bst), [kured-hook.conf](../../files/os/systemd/systemd-sysupdate.service.d/kured-hook.conf), [Kured project](https://github.com/weaveworks/kured). |
+| **Philosophy** | Systemd-native, minimal, image-based server OS; diskless-first (a node boots from a network-pulled image in RAM and updates by rebooting), with an optional disk install. Base /usr includes bash for login and bring-up while heavy developer/debug tools live in sysexts or system containers; container workloads and Kubernetes run via opt-in sysexts. Sources: [AGENTS.md](../../AGENTS.md), [factory-integration.md](factory-integration.md). |
+| **State model** | `/usr` is a read-only erofs filesystem verified by dm-verity, pinned by `usrhash=` on the locked UKI command line. `/etc` is populated from `/usr/share/factory/etc` by systemd-tmpfiles: empty on every boot on a diskless (tmpfs) node, persistent across A/B updates on an installed node. Diskless nodes run from tmpfs. Installed nodes get a persistent xfs root via systemd gpt-auto discovery. Sources: [bluefin-server-usr.bst](../../elements/oci/bluefin-server-usr.bst), [bluefin-server-boot.bst](../../elements/oci/bluefin-server-boot.bst), [50-root.conf](../../files/os/repart.d/50-root.conf). |
+| **Updates** | Installed nodes: `systemd-sysupdate` fills the inactive usr / usr-verity slot (`files/os/sysupdate.d/10-usr.transfer`, `11-usr-verity.transfer`) and installs the new disk UKI with boot counting (`20-uki.transfer`), so a failed update rolls back automatically. Assets are published to GitHub Releases and as an OCI artifact; the combined `SHA256SUMS` manifest covering the whole set is signed inside the image build (`oci/bluefin-server-image.bst`) and `Verify=yes` is the default. `systemd-sysupdate.timer` is enabled by preset, and `systemd-boot-check-no-failures.service` gates `boot-complete.target`, so an update is blessed only when no unit failed; `bluefin-boot-deadline.timer` reboots a counted boot that is not blessed in 15 minutes so systemd-boot falls back, and `bluefin-update-pending` keeps a rolled-back node off the failed version. Diskless nodes update by rebooting into a newer image (sysupdate is disabled when booted diskless); `bluefin-diskless-update-check` flags `/run/reboot-required` when the boot server offers a newer signed release that the next boot would pull (not for a node pinned to a versioned image). Sources: [ddi-installer.md](ddi-installer.md), [systemd-sysupdate-verification.md](systemd-sysupdate-verification.md), [10-usr.transfer](../../files/os/sysupdate.d/10-usr.transfer), [20-uki.transfer](../../files/os/sysupdate.d/20-uki.transfer), [80-bluefin-updates.preset](../../files/os/systemd/system-preset/80-bluefin-updates.preset), [10-diskless.conf](../../files/os/systemd/system/systemd-sysupdate.service.d/10-diskless.conf), also `systemd-sysupdate(8)`. |
+| **Provisioning** | Stock `systemd-sysinstall` copies `/usr` onto a target disk, started either from the offline USB installer (`bluefin-server-installer_<ver>.raw`) or on a diskless-booted node (see [ddi-installer.md](ddi-installer.md)). Per-node configuration is opt-in via Ignition, delivered as `ignition.config` / `ignition.config.url` system credentials (the cmdline is locked inside the signed UKI); Ignition runs on every boot, so configs must be idempotent. First-boot systemd credentials also cover root password, `tmpfiles.extra`, `network.*`, and `firstboot.*`. Sources: [bluefin-server-image.bst](../../elements/oci/bluefin-server-image.bst), [initrd-ignition.bst](../../elements/bluefin-server/initrd/initrd-ignition.bst), [os-creds-prov.bst](../../elements/bluefin-server/os-creds-prov.bst), [tpm2-credential-sealing.md](tpm2-credential-sealing.md). |
+| **Customization** | Adds software through opt-in `systemd-sysext` images (overlay `/usr`): k0s (Kubernetes) and OpenZFS are built in-tree. The base OS `os-release` identifies as `ID=bluefin-server`; the ZFS sysext pins `VERSION_ID` to the image version because its kernel modules are built against the exact FSDK kernel. Sources: [systemd-sysext-extensions.md](systemd-sysext-extensions.md), [k0s-sysext.md](k0s-sysext.md), [os-release.bst](../../elements/bluefin-server/os-release.bst), [systemd-sysext(8)](https://www.freedesktop.org/software/systemd/man/latest/systemd-sysext.html). |
+| **Reboot coordination** | `systemd-sysupdate-reboot.timer` reboots installed nodes into a staged update in a nightly window. `/run/reboot-lock` (until the next boot) or `/etc/reboot-lock` holds the reboot. On Kubernetes nodes an `ExecCondition=` stands the local reboot down while kubelet or k0s runs, and `systemd-sysupdate.service` touches `/run/reboot-required` once an update is pending so Kured drains and reboots nodes one at a time. The lock files and the Kubernetes interlock come from [#182](https://github.com/projectbluefin/server/pull/182). Sources: [20-kured.conf](../../files/os/systemd/system/systemd-sysupdate.service.d/20-kured.conf), [20-interlock.conf](../../files/os/systemd/system/systemd-sysupdate-reboot.service.d/20-interlock.conf), [Kured project](https://github.com/kubereboot/kured). |
 
 ## 4. Factual Gaps
 
 ### Root filesystem and A/B rollback
 
-- **Gap:** Bluefin's `systemd-sysupdate` root transfer already names two target partitions (`root-a` and `root-b`) in `50-root.transfer`, but the installer only creates one root partition (`20-root-a.conf`).
-  There is no `root-b` partition yet, so `systemd-sysupdate` cannot stage an update into an inactive slot and the OS has no atomic rollback path comparable to Flatcar/Fedora CoreOS/Talos today.
-- **Gap:** The DDI filesystem is created as a writable XFS image and the installed UKI boots it with `rw`. A read-only `/usr` state model, as intended by the sysext-first design, is not enforced at runtime.
-- **Gap:** There is no mechanism to select the previous OS version at boot if an update fails; recovery currently depends on reinstalling from media.
+- **Resolved:** installs carry usr slots A and B (`files/os/repart.d/`);
+  `systemd-sysupdate` fills the inactive slot and boot counting on the UKI
+  rolls back a failed update (`just dogfood-install`).
+- **Resolved:** `/usr` is a read-only erofs filesystem verified by dm-verity;
+  the read-only state model is enforced at runtime, not by convention.
 
 ### Provisioning
 
-- **Gap:** The documented `systemd-creds` first-boot provisioning for SSH keys (`tmpfiles.extra`) is not present in the build (`os-creds-prov.bst` only ships `sysusers.d`).
-  Operators can only pre-seed the root password today.
-- **Gap:** `systemd-firstboot` is masked in the installer environment, so interactive first-boot questions are skipped; any further user/network/timezone configuration must be supplied through credentials that the build does not yet consume.
-- **Gap:** TPM2 sealing for credentials is documented in `docs/skills/tpm2-credential-sealing.md`, but there is no evidence in the OS build that sealed credentials are generated, shipped, or decrypted automatically during first boot.
+- **Remaining gap:** The credential consumers are wired through systemd-native
+  facilities, but TPM2-sealed credential decryption still needs a hardware boot
+  proof on a TPM2-equipped host.
 
 ### Update delivery
 
-- **Gap:** The root transfer uses `Type=partition Path=auto`, which requires `systemd-sysupdate` to discover a matching GPT partition label (`bluefin-server-root-a`/`root-b`). This is correct, but without a `root-b` partition the transfer effectively overwrites the running root in place.
-- **Gap:** `systemd-sysupdate-reboot.service`/`systemd-sysupdate-reboot.timer` are not enabled or configured; the only reboot signal today is the Kured hook.
+- **Resolved:** installed nodes update and reboot on their own (`80-bluefin-updates.preset`), a boot is blessed only when no unit failed and is rebooted back to the previous image when it is not blessed in time (`bluefin-boot-deadline.timer`), and diskless nodes get a signed update signal (`bluefin-diskless-update-check`).
+- **Resolved:** the diskless pull of the OS DDI runs with `verify=signature`; the initrd ships gnupg and the image keyring, so the download is checked against the signed `SHA256SUMS` before the pinned `usrhash=` / dm-verity checks even begin.
 
 ### Customization
 
-- **No major gap found relative to the design intent.** `systemd-sysext` and Flatcar Bakery compatibility match the intended extension model. The main operational concern is that, because `/usr` is not mounted read-only, a sysext merge vs. runtime writes to `/usr` have different guarantees than on Flatcar or Fedora CoreOS.
+- **No major gap found relative to the design intent.** `systemd-sysext` with a read-only, verity-sealed `/usr` matches the guarantees of Flatcar or Fedora CoreOS. Third-party extensions built for another distribution need `merge --force` since the host identifies as `ID=bluefin-server`.
 
 ### Reboot coordination
 
-- **Gap:** Kured coordinates Kubernetes node reboots but requires Kubernetes to be running. There is no equivalent for single-node or non-Kubernetes Bluefin hosts, and there is no built-in cluster lock manager similar to Zincati's FleetLock or Flatcar's `locksmithd`/`etcd-lock`.
+- **Resolved:** single-node and non-Kubernetes hosts reboot in the nightly `systemd-sysupdate-reboot.timer` window, held by `/run/reboot-lock` or `/etc/reboot-lock`; Kubernetes nodes stand down for Kured (lock files and interlock from #182).
+- **Gap:** there is no built-in cluster lock manager similar to Zincati's FleetLock or Flatcar's `locksmithd`/`etcd-lock`, so non-Kubernetes hosts that serve together may reboot in the same window.
 
 ## 5. Summary of Biggest Gaps
 
-1. **A/B dual-slot rollback is not wired end-to-end.** The `sysupdate` transfer names `root-a`/`root-b`, but the installer only provisions `root-a`, so Bluefin cannot atomically stage and roll back a new root image today.
-2. **Root filesystem immutability is not enforced.** The DDI is built and booted read-write; the intended read-only `/usr` + overlay model depends entirely on optional sysext behavior rather than runtime policy.
-3. **First-boot credential provisioning is incomplete.** Only the `root` password credential path is shipped; SSH keys, network configuration, and other `systemd-creds`-based provisioning remain documented but not implemented.
+1. **No cluster-wide reboot lock outside Kubernetes.** Hosts reboot in a nightly window; there is no FleetLock/locksmith equivalent for non-Kubernetes fleets.
+2. **Credential provisioning hardware proof is incomplete.** SSH keys, Ignition configs, network files, and firstboot settings are wired through systemd credentials; TPM2-sealed decryption still needs a hardware boot proof.
+
+The earlier gap on the unverified diskless DDI download is closed: the pull
+runs with `verify=signature` against the keyring in the initrd.
 
 These gaps drive the priorities in [architecture-roadmap.md](architecture-roadmap.md).
 
@@ -142,31 +147,18 @@ These gaps drive the priorities in [architecture-roadmap.md](architecture-roadma
 
 ### Upstream distribution documentation
 
+Specific claims carry inline links in section 2. Documentation roots:
+
 - Ubuntu Server / autoinstall / cloud-init
   - <https://documentation.ubuntu.com/server/>
-  - <https://raw.githubusercontent.com/canonical/ubuntu-server-documentation/main/docs/how-to/software/automatic-updates.md>
-  - <https://raw.githubusercontent.com/canonical/ubuntu-server-documentation/main/docs/how-to/software/upgrade-your-release.md>
-  - <https://raw.githubusercontent.com/canonical/ubuntu-server-documentation/main/docs/how-to/software/package-management.md>
   - <https://canonical-subiquity.readthedocs-hosted.com/en/latest/intro-to-autoinstall.html>
   - <https://cloudinit.readthedocs.io/>
-- Talos Linux
-  - <https://docs.siderolabs.com/talos/v1.13/overview/what-is-talos.md>
-  - <https://docs.siderolabs.com/talos/v1.13/configure-your-talos-cluster/lifecycle-management/upgrading-talos.md>
-  - <https://docs.siderolabs.com/talos/v1.13/build-and-extend-talos/custom-images-and-development/system-extensions.md>
-  - <https://docs.siderolabs.com/talos/v1.13/reference/configuration/overview.md>
-- Flatcar Container Linux
-  - <https://raw.githubusercontent.com/flatcar/flatcar-docs/main/docs/setup/releases/update-strategies.md>
-  - <https://raw.githubusercontent.com/flatcar/flatcar-docs/main/docs/provisioning/ignition/_index.md>
-  - <https://raw.githubusercontent.com/flatcar/flatcar-docs/main/docs/provisioning/sysext/_index.md>
+- Talos Linux — <https://docs.siderolabs.com/talos/v1.13/>
+- Flatcar Container Linux — <https://www.flatcar.org/docs/latest/>
 - Fedora CoreOS / rpm-ostree / Zincati
-  - <https://raw.githubusercontent.com/coreos/fedora-coreos-docs/main/modules/ROOT/pages/index.adoc>
-  - <https://raw.githubusercontent.com/coreos/fedora-coreos-docs/main/modules/ROOT/pages/auto-updates.adoc>
-  - <https://raw.githubusercontent.com/coreos/fedora-coreos-docs/main/modules/ROOT/pages/producing-ign.adoc>
-  - <https://raw.githubusercontent.com/coreos/fedora-coreos-docs/main/modules/ROOT/pages/running-containers.adoc>
-  - <https://raw.githubusercontent.com/coreos/fedora-coreos-docs/main/modules/ROOT/pages/faq.adoc>
-  - <https://raw.githubusercontent.com/coreos/rpm-ostree/main/README.md>
+  - <https://docs.fedoraproject.org/en-US/fedora-coreos/>
+  - <https://coreos.github.io/rpm-ostree/>
   - <https://coreos.github.io/zincati/>
-  - <https://coreos.github.io/zincati/development/fleetlock/>
 
 ### systemd reference
 
@@ -184,14 +176,21 @@ These gaps drive the priorities in [architecture-roadmap.md](architecture-roadma
 - [k0s-sysext.md](k0s-sysext.md)
 - [factory-integration.md](factory-integration.md)
 - [tpm2-credential-sealing.md](tpm2-credential-sealing.md)
-- [elements/oci/bluefin-server-ddi.bst](../../elements/oci/bluefin-server-ddi.bst)
-- [elements/oci/bluefin-server-installer.bst](../../elements/oci/bluefin-server-installer.bst)
-- [elements/bluefin-server/os-release-flatcar.bst](../../elements/bluefin-server/os-release-flatcar.bst)
+- [elements/oci/bluefin-server-usr.bst](../../elements/oci/bluefin-server-usr.bst)
+- [elements/oci/bluefin-server-boot.bst](../../elements/oci/bluefin-server-boot.bst)
+- [elements/oci/bluefin-server-image.bst](../../elements/oci/bluefin-server-image.bst)
+- [elements/bluefin-server/os-release.bst](../../elements/bluefin-server/os-release.bst)
 - [elements/bluefin-server/os-creds-prov.bst](../../elements/bluefin-server/os-creds-prov.bst)
-- [elements/bluefin-server/os-kured-hook.bst](../../elements/bluefin-server/os-kured-hook.bst)
-- [files/installer/repart.d/20-root-a.conf](../../files/installer/repart.d/20-root-a.conf)
-- [files/os/sysupdate.d/50-root.transfer](../../files/os/sysupdate.d/50-root.transfer)
-- [files/os/sysupdate.d/60-uki.transfer](../../files/os/sysupdate.d/60-uki.transfer)
+- [elements/bluefin-server/initrd/initrd-ignition.bst](../../elements/bluefin-server/initrd/initrd-ignition.bst)
+- [files/os/repart.d/50-root.conf](../../files/os/repart.d/50-root.conf)
+- [files/os/sysupdate.d/10-usr.transfer](../../files/os/sysupdate.d/10-usr.transfer)
+- [files/os/sysupdate.d/20-uki.transfer](../../files/os/sysupdate.d/20-uki.transfer)
 - [files/os/sysupdate.k0s.d/70-k0s.transfer](../../files/os/sysupdate.k0s.d/70-k0s.transfer)
 - [files/os/sysusers.d/10-root-creds.conf](../../files/os/sysusers.d/10-root-creds.conf)
-- [files/os/systemd/systemd-sysupdate.service.d/kured-hook.conf](../../files/os/systemd/systemd-sysupdate.service.d/kured-hook.conf)
+- [files/os/systemd/system-preset/80-bluefin-updates.preset](../../files/os/systemd/system-preset/80-bluefin-updates.preset)
+- [files/os/systemd/system/systemd-sysupdate.service.d/20-kured.conf](../../files/os/systemd/system/systemd-sysupdate.service.d/20-kured.conf)
+- [files/os/systemd/system/systemd-sysupdate-reboot.service.d/20-interlock.conf](../../files/os/systemd/system/systemd-sysupdate-reboot.service.d/20-interlock.conf)
+- [files/os/systemd/system/bluefin-boot-deadline.timer](../../files/os/systemd/system/bluefin-boot-deadline.timer)
+- [files/os/update-check/usr/libexec/bluefin-boot-deadline](../../files/os/update-check/usr/libexec/bluefin-boot-deadline)
+- [files/os/update-check/usr/libexec/bluefin-diskless-update-check](../../files/os/update-check/usr/libexec/bluefin-diskless-update-check)
+- [files/os/systemd/system/systemd-sysupdate.service.d/10-diskless.conf](../../files/os/systemd/system/systemd-sysupdate.service.d/10-diskless.conf)

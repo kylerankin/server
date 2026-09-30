@@ -1,9 +1,16 @@
 # Bluefin Server — Agent Entry Point
 
-Bluefin Server is an FSDK-based, image-based Linux server OS. It produces:
-- an immutable XFS DDI OS payload (`oci/bluefin-server-ddi.bst`)
-- an offline, systemd-native installer raw disk (`oci/bluefin-server-installer.bst`)
-- an optional k0s `systemd-sysext` (`oci/k0s-sysext.bst`)
+Bluefin Server is an image-based Linux server OS composed from freedesktop-sdk (FSDK) 26.08 components with BuildStream 2. One build of `oci/bluefin-server-image.bst` produces the full release set for one image version:
+- the /usr image (`oci/bluefin-server-usr.bst`): an erofs partition plus its dm-verity hash partition, with the root hash recorded in a `usrhash` file
+- three signed UKIs (`oci/bluefin-server-boot.bst`): a netboot UKI that pulls the OS DDI into RAM for a diskless boot, a disk UKI for installed nodes, and an installer UKI for the USB installer
+- the OS DDI `bluefin-server_<ver>.raw` (usr + usr-verity + ESP), which doubles as the installer payload for diskless installs
+- a netboot ESP image with signed systemd-boot and Secure Boot key enrollment payloads
+- an offline USB installer `bluefin-server-installer_<ver>.raw` (usr + usr-verity + ESP with systemd-boot, the installer UKI, the disk UKI and `repart.d`) that boots into `systemd-sysinstall`
+- optional opt-in `systemd-sysext` images: `oci/k0s-sysext.bst` (controller, or worker when `/etc/k0s/token` exists), `oci/kubestellar-sysext.bst` (Argo CD, KubeStellar, kiosk; needs k0s), `oci/kubeadm-sysext.bst` (kubeadm worker: kubelet, containerd) and `oci/zfs-sysext.bst`
+- an SPDX 2.3 SBOM `bluefin-server_<ver>.spdx.json` (`oci/bluefin-server-sbom.bst`)
+- a `SHA256SUMS` over the whole set, signed in-element (`SHA256SUMS.gpg`); nodes verify it against `/etc/systemd/import-pubring.pgp`
+
+A release publishes `dist/diskless/` as-is: a GitHub Release `v<ver>` and an ORAS OCI artifact `ghcr.io/<owner>/bluefin-server:<ver>,latest`, both with provenance and SBOM attestations; pull requests rehearse it in `release-dry-run`.
 
 ## What agents should know first
 
@@ -18,11 +25,11 @@ Bluefin Server is an FSDK-based, image-based Linux server OS. It produces:
 
 ## Hard rules
 
-1. Compose from FSDK 26.08 `components/*`. Never use `platform.bst`.
+1. The OS composes from FSDK components via BuildStream. No Flatcar or other-distro binaries. Never use `platform.bst`.
 2. Keep the CPU baseline broad: no `x86_64_v3`.
-3. Installer must stay `systemd-sysinstall`-native and `systemd-repart`-based; no custom installer scripts or non-native installers.
-4. Deliver k0s as an optional `systemd-sysext`; never bundle Kubernetes or container runtimes into the base OS DDI.
-5. Boot entries use GPT `PARTUUID`; never hardcode device paths.
+3. Installation stays `systemd-sysinstall`-native and `systemd-repart`-based; no shell installers or non-native installer scripts.
+4. Kubernetes, ZFS, and container runtimes ship only as opt-in `systemd-sysext` images, never in the base /usr, and no preset enables them.
+5. /usr is a read-only erofs filesystem verified by dm-verity, pinned by `usrhash=` in a signed UKI. Boot and root selection uses discoverable partitions and verity-derived UUIDs; never hardcode device paths.
 6. One canonical source per fact; do not duplicate content across docs.
 
 ## Commit and attribution conventions
@@ -37,31 +44,38 @@ Bluefin Server is an FSDK-based, image-based Linux server OS. It produces:
 
 ## Build / test commands
 
-All `just` targets run BuildStream inside the FSDK `bst2` container via `just bst`; BuildStream is not installed locally.
+All local `just` targets run BuildStream inside the FSDK `bst2` container via `just bst`; BuildStream is not installed locally.
 
 | Command | Purpose |
 |---|---|
 | `just validate` | Merge-contract graph check — run this on every change. |
-| `just build-ddi` | Local OS DDI payload build. |
-| `just export-ddi` | Export DDI artifacts to `dist/ddi/`. |
-| `just build-installer` | Local full installer build. |
-| `just export-installer` | Export installer + UKI to `dist/`. |
-| `just build-sysext` | Build the k0s `systemd-sysext`. |
-| `just export-sysext` | Export sysext artifacts to `dist/sysext/`. |
-| `just show-me-the-future` | Local QEMU installer smoke test. |
+| `just test-unit` | Unit tests (pytest + bats). |
+| `just gen-dev-keys` | Generate throwaway Secure Boot, module, and image (`SHA256SUMS`) signing keys in `files/boot-keys/` (gitignored). |
+| `just set-version V` | Set `image-version` in `include/image.yml` (≤17 chars, increasing under strverscmp). |
+| `just build-image` / `just export-image` | Build and export the release image set to `dist/diskless/`. |
+| `just dogfood` / `just dogfood-check` | Boot `dist/diskless/` diskless in QEMU with Secure Boot (interactive / headless probe). |
+| `just dogfood-install NEXT=<dir>` | QEMU end-to-end: diskless boot, install to disk, boot it, then A/B update to NEXT. |
+| `just publish-oci REF [DIR] [PLAIN_HTTP]` | Push `dist/diskless/` as an ORAS OCI artifact tagged `<version>,latest` (one layer per file). Local rehearsal; CI publishes via `scripts/publish-release.sh`. |
+| `just build-sysext` / `just export-sysext` | Build and export the k0s and KubeStellar `systemd-sysext` images. |
+| `just build-zfs-sysext` / `just export-zfs-sysext` | Build and export the OpenZFS `systemd-sysext`. |
 
 ## Skill routing
 
 | Task | Skill |
 |---|---|
-| Build or debug the installer / DDI | [`docs/skills/ddi-installer.md`](docs/skills/ddi-installer.md), [`docs/skills/ddi-installer-build.md`](docs/skills/ddi-installer-build.md) |
+| Boot / install / update architecture and local build + dogfood | [`docs/skills/ddi-installer.md`](docs/skills/ddi-installer.md), [`docs/skills/ddi-installer-build.md`](docs/skills/ddi-installer-build.md) |
+| Offline USB installer (unattended installs, install-time provisioning) | [`docs/skills/usb-installer.md`](docs/skills/usb-installer.md) |
+| Network boot at scale (Booty: HTTP boot, per-node Ignition) | [`docs/skills/booty-integration.md`](docs/skills/booty-integration.md) |
+| Diskless boot failures, RAM sizing, node logs, Ignition configs | [`docs/skills/diskless-troubleshooting.md`](docs/skills/diskless-troubleshooting.md) |
 | Factory role, k0s sysext rationale, lab integration | [`docs/skills/factory-integration.md`](docs/skills/factory-integration.md) |
 | Work with `systemd-sysext` / `systemd-confext` | [`docs/skills/systemd-sysext-extensions.md`](docs/skills/systemd-sysext-extensions.md) |
+| Build or run the kubeadm worker sysext | [`docs/skills/kubeadm-sysext.md`](docs/skills/kubeadm-sysext.md) |
 | Build or ship the k0s sysext | [`docs/skills/k0s-sysext.md`](docs/skills/k0s-sysext.md), [`docs/skills/k0s-sysext-ops.md`](docs/skills/k0s-sysext-ops.md) |
 | Update the FSDK pin / versioning | [`docs/skills/bump-fsdk-version.md`](docs/skills/bump-fsdk-version.md) |
 | CI workflows, action SHA pinning | [`docs/skills/ci-tooling.md`](docs/skills/ci-tooling.md) |
 | Release signing / sysupdate trust | [`docs/skills/systemd-sysupdate-verification.md`](docs/skills/systemd-sysupdate-verification.md) |
-| Credential sealing with TPM2 | [`docs/skills/tpm2-credential-sealing.md`](docs/skills/tpm2-credential-sealing.md) |
+| Secure Boot / module / signing key inventory, rotation, CI secrets | [`docs/skills/secure-boot-keys.md`](docs/skills/secure-boot-keys.md) |
+| Node access (root / SSH) and credential sealing with TPM2 | [`docs/skills/tpm2-credential-sealing.md`](docs/skills/tpm2-credential-sealing.md) |
 | System containers (`machinectl`) | [`docs/skills/system-containers.md`](docs/skills/system-containers.md) |
 | Cut bloat / avoid over-engineering | [`docs/skills/avoid-over-engineering.md`](docs/skills/avoid-over-engineering.md) |
 | Add or refactor skills | [`docs/skills/skill-improvement.md`](docs/skills/skill-improvement.md) |
@@ -77,7 +91,7 @@ All `just` targets run BuildStream inside the FSDK `bst2` container via `just bs
 
 - Do not add Containerfiles or shell-based installers.
 - Do not hardcode block device paths in boot configuration.
-- Do not put Kubernetes or debug tooling in the base DDI if it can live in a sysext or system container.
+- Do not put Kubernetes, ZFS, or debug tooling in the base /usr if it can live in a sysext or system container.
 - Do not duplicate a fact already in a skill.
 - Never hardcode internal-only hostnames or IPs; use `<build-cache-host>` / `<registry-host>:30500` placeholders.
 - Never refer to counting or usage metrics as telemetry; call it countme.

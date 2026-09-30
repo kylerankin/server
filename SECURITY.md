@@ -31,18 +31,17 @@ We follow coordinated disclosure:
 
 ## Supported Versions
 
-Bluefin Server has no long-term support branches. Versioning is derived from
-the pinned freedesktop-sdk release (run `just version` / `just tags`), and
-`systemd-sysupdate` pulls updates exclusively from the **latest** GitHub
-Release. Only the latest release receives fixes; older point releases are not
-maintained. If you are running an older release, update before reporting — the
-issue may already be fixed.
+Bluefin Server has no long-term support branches. Releases are tagged
+`v<image-version>` (one per build; `systemd-sysupdate` pulls updates
+exclusively from the **latest** GitHub Release). Only the latest release
+receives fixes; older releases are not maintained. If you are running an older
+release, update before reporting — the issue may already be fixed.
 
 ## Verifying Release Artifacts
 
 Every GitHub Release contains a single combined `SHA256SUMS` manifest and its
-detached, ASCII-armored GPG signature `SHA256SUMS.gpg`, produced by the
-`build-and-release` workflow. Verify a downloaded artifact set with the public
+detached GPG signature `SHA256SUMS.gpg`, produced by the
+`build.yml` workflow. Verify a downloaded artifact set with the public
 keyring shipped in this repository:
 
 ```sh
@@ -61,13 +60,13 @@ For the full trust model, key rotation, and transfer configuration, see
 
 This policy covers everything this repository produces and its build pipeline:
 
-- The OS DDI payload, the offline installer disk image, and the k0s
-  `systemd-sysext`.
+- The OS DDI, the signed UKIs and netboot ESP image, and the k0s and OpenZFS
+  `systemd-sysext` images.
 - BuildStream elements, build tooling, and GitHub Actions workflows.
 - Release signing and the `systemd-sysupdate` update/verification flow.
 
 **Out of scope:** vulnerabilities in upstream components such as
-freedesktop-sdk, GNOME build metadata, systemd, or k0s itself. Report those to
+freedesktop-sdk, systemd, or k0s itself. Report those to
 the respective upstream project; report to this repository only when the issue
 is introduced by our integration, build, signing, or packaging of the
 component.

@@ -19,7 +19,7 @@ def test_manual_and_script_elements_depend_on_base_stack():
     """Ensure all manual/script elements have base/base-stack.bst in build-depends."""
     for bst_path in ELEMENTS_DIR.rglob("*.bst"):
         # Skip external junction declarations
-        if bst_path.name in ("freedesktop-sdk.bst", "gnome-build-meta.bst"):
+        if bst_path.name == "freedesktop-sdk.bst":
             continue
 
         content = bst_path.read_text(encoding="utf-8")
@@ -47,14 +47,15 @@ def test_manual_and_script_elements_depend_on_base_stack():
             )
 
 
-def test_compose_elements_set_integrate_false():
-    """Ensure compose elements set integrate: False to avoid invoking nonexistent /bin/sh.
+def test_compose_elements_declare_integration_explicitly():
+    """Compose elements must say whether integration commands run.
 
-    In FSDK 26.08, shell-less or minimal target images fail if BuildStream attempts
-    to execute integration scripts in the composed sandbox.
+    Shell-less compositions must set integrate: False (FSDK 26.08
+    runtime-minimal has no /bin/sh). Compositions that ship a shell and need
+    integration (the ld.so cache, hwdb) opt in with integrate: True.
     """
     for bst_path in ELEMENTS_DIR.rglob("*.bst"):
-        if bst_path.name in ("freedesktop-sdk.bst", "gnome-build-meta.bst"):
+        if bst_path.name == "freedesktop-sdk.bst":
             continue
 
         content = bst_path.read_text(encoding="utf-8")
@@ -66,67 +67,68 @@ def test_compose_elements_set_integrate_false():
             continue
 
         config = data.get("config", {})
-        assert config.get("integrate") is False, (
+        assert config.get("integrate") in (True, False), (
             f"{bst_path.relative_to(REPO_ROOT)} is kind: compose but does not set "
-            f"'integrate: False' in config"
+            f"'integrate:' explicitly in config"
         )
 
 
-def test_os_stack_uses_uutils_not_gnu():
-    """Bluefin Server OS must use uutils-coreutils, not GNU userspace."""
+def test_os_stack_uses_fsdk_base():
+    """The OS payload is pure freedesktop-sdk: os-base.bst, no Flatcar imports."""
     os_stack = ELEMENTS_DIR / "bluefin-server" / "os-stack.bst"
-    data = yaml.safe_load(os_stack.read_text(encoding="utf-8"))
+    depends = yaml.safe_load(os_stack.read_text(encoding="utf-8")).get("depends", [])
+    os_base = ELEMENTS_DIR / "bluefin-server" / "os-base.bst"
+    base_depends = yaml.safe_load(os_base.read_text(encoding="utf-8")).get("depends", [])
+
+    assert "bluefin-server/os-base.bst" in depends
+    assert "freedesktop-sdk.bst:components/systemd.bst" in base_depends
+    assert "bluefin-server/kernel-modules.bst" in base_depends
+    for dep in depends + base_depends:
+        assert not dep.startswith("flatcar/"), (
+            f"OS payload must not import Flatcar binaries ({dep})"
+        )
+
+
+
+def test_os_countme_depends_on_curl_and_jq():
+    """os-countme.bst must ship curl and jq through the freedesktop-sdk junction.
+
+    Regression test for projectbluefin/server#96: the curl dependency was
+    inferred rather than verified, so a wrong path would fail to resolve and
+    the minimal image (which ships neither curl nor jq) would not build.
+    Confirmed that the pinned freedesktop-sdk ref (freedesktop-sdk-26.08.0,
+    elements/freedesktop-sdk.bst) ships both elements/components/curl.bst and
+    elements/components/jq.bst, so the dependency must stay on this exact path.
+    """
+    countme = ELEMENTS_DIR / "bluefin-server" / "os-countme.bst"
+    data = yaml.safe_load(countme.read_text(encoding="utf-8"))
     depends = data.get("depends", [])
 
-    assert "bluefin-server/uutils-coreutils.bst" in depends, (
-        "os-stack.bst must include bluefin-server/uutils-coreutils.bst"
+    assert "freedesktop-sdk.bst:components/curl.bst" in depends, (
+        "os-countme.bst must include freedesktop-sdk.bst:components/curl.bst "
+        "(projectbluefin/server#96)"
     )
-    assert "freedesktop-sdk.bst:public-stacks/runtime-gnu.bst" not in depends, (
-        "os-stack.bst must NOT depend on GNU userspace (runtime-gnu.bst)"
-    )
-
-
-def test_os_stack_includes_dbus_broker():
-    """Bluefin Server OS must include dbus and dbus-broker for system services."""
-    os_stack = ELEMENTS_DIR / "bluefin-server" / "os-stack.bst"
-    data = yaml.safe_load(os_stack.read_text(encoding="utf-8"))
-    depends = data.get("depends", [])
-
-    assert "freedesktop-sdk.bst:components/dbus.bst" in depends, (
-        "os-stack.bst must include freedesktop-sdk.bst:components/dbus.bst for dbus.socket"
-    )
-    assert "freedesktop-sdk.bst:components/dbus-broker.bst" in depends, (
-        "os-stack.bst must include freedesktop-sdk.bst:components/dbus-broker.bst"
+    assert "freedesktop-sdk.bst:components/jq.bst" in depends, (
+        "os-countme.bst must include freedesktop-sdk.bst:components/jq.bst "
+        "(projectbluefin/server#96)"
     )
 
 
-def test_installer_stack_includes_uutils_and_dbus():
-    """Installer stack must include uutils-coreutils, dbus, and dbus-broker."""
-    installer_stack = ELEMENTS_DIR / "installer" / "installer-stack.bst"
-    data = yaml.safe_load(installer_stack.read_text(encoding="utf-8"))
-    depends = data.get("depends", [])
-
-    assert "bluefin-server/uutils-coreutils.bst" in depends, (
-        "installer-stack.bst must include bluefin-server/uutils-coreutils.bst"
-    )
-    assert "freedesktop-sdk.bst:components/dbus.bst" in depends, (
-        "installer-stack.bst must include freedesktop-sdk.bst:components/dbus.bst for dbus.socket"
-    )
-    assert "freedesktop-sdk.bst:components/dbus-broker.bst" in depends, (
-        "installer-stack.bst must include freedesktop-sdk.bst:components/dbus-broker.bst"
-    )
+def _build_depends(element):
+    data = yaml.safe_load((ELEMENTS_DIR / element).read_text(encoding="utf-8"))
+    return {d if isinstance(d, str) else d["filename"] for d in data.get("build-depends", [])}
 
 
-def test_os_stack_includes_bash():
-    """Bluefin Server OS must include bash for login and interactive access."""
-    os_stack = ELEMENTS_DIR / "bluefin-server" / "os-stack.bst"
-    data = yaml.safe_load(os_stack.read_text(encoding="utf-8"))
-    depends = data.get("depends", [])
+def test_sbom_lists_every_published_sysext_and_its_payload():
+    """collect_manifest follows only runtime dependencies of what it lists.
 
-    assert "freedesktop-sdk.bst:bootstrap/bash.bst" in depends, (
-        "os-stack.bst must include freedesktop-sdk.bst:bootstrap/bash.bst"
-    )
+    A sysext only build-depends on the upstream payload it stages, so the
+    SBOM must list the sysext (its own local sources) and the payload.
+    """
+    sysexts = {d for d in _build_depends("oci/bluefin-server-image.bst") if d.endswith("-sysext.bst")}
+    sbom = _build_depends("oci/bluefin-server-sbom.bst")
 
-
-
+    assert sysexts
+    assert sysexts <= sbom, f"SBOM misses {sorted(sysexts - sbom)}"
+    assert {"k0s/k0s-bin.bst", "kubeadm/kubeadm-bin.bst", "zfs/openzfs.bst"} <= sbom
 
