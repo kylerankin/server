@@ -35,21 +35,37 @@ synced; they are for booting without Booty.
 ## Per-node configuration
 
 Booty renders a `bluefin-node.ign` (Ignition spec 3.6.0) per MAC address and
-serves it next to the UKI. A node with no `ignition.config` /
-`ignition.config.url` credential HEADs it next to its boot origin and, when
-present, applies it through a `config.replace` stub (see
-[ddi-installer.md](ddi-installer.md), "Ignition"). Fields include hostname,
-SSH keys (which also enable `sshd.service`, disabled by preset in the image),
-state disk, extensions (any of `zfs`, `kubestellar`, `k0s`), and a k0s token.
+serves it next to the UKI. Fields include hostname, SSH keys (which also
+enable `sshd.service`, disabled by preset in the image), state disk,
+extensions (any of `zfs`, `kubestellar`, `k0s`), and a k0s token.
 
-The config is fetched over https only — a plain `http://` boot origin is
-refused — and if Booty publishes a detached signature (`bluefin-node.ign.gpg`)
-it is verified with `gpgv` against the import keyring (the same root as the
-image pull) before the verified bytes are staged inline at
-`/run/ignition/user.ign`. Until Booty signs per-MAC configs, an https server
-without a `.gpg` still stages the config, flagged unauthenticated; refusing
-unsigned https configs is the intended fail-closed end-state and waits on that
-Booty-side signing change (issue #284).
+A node with no `ignition.config` / `ignition.config.url` credential HEADs
+`bluefin-node.ign` next to its boot origin. Nothing there means nothing to
+apply. If it is there, `bluefin-ignition-credentials` in the initrd applies it
+only if it is signed:
+
+- It fetches `bluefin-node.ign.gpg` from the same directory and verifies it
+  with `gpgv` against the import keyring (the `/etc/systemd/import-pubring.pgp`
+  override, else the image's `/usr/lib/systemd/import-pubring.pgp`: the same
+  root as the image pull), then stages the verified bytes inline at
+  `/run/ignition/user.ign`, so Ignition applies exactly what was signed. The
+  signature is the gate, not the transport: plain `http://` works, as it does
+  for the `/usr` pull.
+- Only an HTTP 404 on the `.gpg` counts as "unsigned", and an unsigned config
+  is applied only with the system credential `bluefin.ignition.allow-unsigned`
+  (any non-empty value), a trust-the-network opt-out that costs nothing
+  extra: whoever can set it can already set `ignition.config`. Any other
+  failure fetching the `.gpg` (5xx, timeout, dropped connection), or a
+  signature that does not verify, fails the boot into emergency mode
+  (`bluefin-ignition-credentials.service` has `OnFailure=emergency.target`).
+- A signed config must be self-contained. Ignition fetches
+  `ignition.config.merge` / `replace` targets and remote
+  `storage.files[].contents.source` URLs without checking them against any
+  signature, so each such source needs a `verification.hash`.
+
+Booty signing per-MAC configs is tracked in issue #284. Until it does,
+plain-network Booty deployments that serve `bluefin-node.ign` need the
+opt-out credential, or they stop at emergency mode.
 
 ## Install to disk
 

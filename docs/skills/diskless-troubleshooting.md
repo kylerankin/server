@@ -139,13 +139,14 @@ Stages wired into the initrd (`files/initrd-ignition/`), in order:
 `kargs` stage is not wired, so `kernelArguments` is silently not applied: the
 command line is sealed in the signed UKI.
 
-The config is fetched over https only — a plain `http://` origin is refused —
-and if the boot server publishes a detached signature (`bluefin-node.ign.gpg`)
-it is verified with `gpgv` against the import keyring before the verified bytes
-are staged inline at `/run/ignition/user.ign`. Until Booty signs per-MAC
-configs, an https server without a `.gpg` still stages the config,
-flagged unauthenticated; refusing unsigned https configs is the intended
-fail-closed end-state, gated on that Booty-side signing change (issue #284).
+A `bluefin-node.ign` served next to the UKI is applied only with a valid
+`bluefin-node.ign.gpg`, or unsigned with the `bluefin.ignition.allow-unsigned`
+credential; see "Per-node configuration" in
+[booty-integration.md](booty-integration.md). A node that stops in emergency
+mode right after the network comes up with `bluefin-ignition-credentials`
+failed is refusing its config: `journalctl -u bluefin-ignition-credentials`
+says whether the signature did not verify, could not be fetched, or is
+missing without the opt-out.
 
 | Config section | Supported |
 |---|---|

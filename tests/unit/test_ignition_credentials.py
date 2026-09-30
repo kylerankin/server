@@ -2,14 +2,13 @@
 
 bluefin-ignition-credentials stages an Ignition config from a system credential
 or, for a network-booted node, from bluefin-node.ign next to the UKI. The
-Ignition config used to be fetched and applied with no signature or hash — an
-on-path attacker on the (often plain-HTTP) provisioning network got root despite
-the signed boot chain. This verifies the fix: a plain http:// origin is refused,
-a detached signature (bluefin-node.ign.gpg) is checked against the import
-keyring and the verified bytes staged inline, and an https origin without a
-signature still provisions but is flagged unauthenticated. Both run against a
-local HTTPS server (curl trusts its self-signed cert via CURL_CA_BUNDLE) and a
-throwaway GnuPG key; no files/boot-keys are needed.
+node config used to be applied with no signature: an on-path attacker on the
+(often plain-HTTP) provisioning network got root despite the signed boot
+chain. The signature is now the gate, whatever the transport: a config next to
+the UKI is applied only if bluefin-node.ign.gpg verifies against the import
+keyring, or, unsigned (the .gpg is a 404, nothing else), with the
+bluefin.ignition.allow-unsigned credential. Runs against local HTTP and HTTPS
+servers and throwaway GnuPG keys; no files/boot-keys are needed.
 """
 
 from __future__ import annotations
@@ -51,15 +50,6 @@ def test_ships_in_the_initrd_stack_and_is_executable_bash() -> None:
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
 
 
-def test_uses_the_import_keyring_and_refuses_plain_http() -> None:
-    body = SCRIPT.read_text(encoding="utf-8")
-    # same trust root as the /usr image pull and sysupdate
-    assert "/etc/systemd/import-pubring.pgp" in body
-    assert "/usr/lib/systemd/import-pubring.pgp" in body
-    # the headline fix: a plain http origin is refused, automatic or credential
-    assert 'http://*) die' in body
-    assert "fetched and applied with no signature" in body
-
 
 @pytest.fixture(scope="module")
 def keys(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
@@ -81,35 +71,73 @@ def keys(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     return out
 
 
-class QuietHandler(SimpleHTTPRequestHandler):
+class Handler(SimpleHTTPRequestHandler):
+    """Serves a directory; FAIL maps a request path to an HTTP status, or to
+    "drop" to close the connection without a response."""
+
+    FAIL: dict[str, int | str] = {}
+
     def log_message(self, *args) -> None:
         pass
 
+    def _override(self) -> bool:
+        action = self.FAIL.get(self.path)
+        if action is None:
+            return False
+        if action == "drop":
+            self.close_connection = True
+            self.connection.shutdown(2)
+        else:
+            self.send_error(int(action))
+        return True
 
-def _serve(root: Path, cert_dir: Path) -> tuple[ThreadingHTTPServer, str]:
+    def do_GET(self) -> None:
+        if not self._override():
+            super().do_GET()
+
+    def do_HEAD(self) -> None:
+        if not self._override():
+            super().do_HEAD()
+
+
+def _serve(root: Path, fail: dict[str, int | str], cert_dir: Path | None) -> tuple[ThreadingHTTPServer, str]:
     import ssl
 
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(certfile=str(cert_dir / "cert.pem"), keyfile=str(cert_dir / "key.pem"))
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(QuietHandler, directory=str(root)))
-    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    url = f"https://127.0.0.1:{httpd.server_address[1]}"
-    return httpd, url
+    handler = type("H", (Handler,), {"FAIL": fail})
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(handler, directory=str(root)))
+    scheme = "http"
+    if cert_dir is not None:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=str(cert_dir / "cert.pem"), keyfile=str(cert_dir / "key.pem"))
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, f"{scheme}://127.0.0.1:{httpd.server_address[1]}"
 
 
 @pytest.fixture()
 def origin(tmp_path: Path):
-    # A self-signed cert for 127.0.0.1; curl is pointed at it via CURL_CA_BUNDLE.
+    """A plain-HTTP boot server: (url, served directory, FAIL overrides)."""
     srv = tmp_path / "srv"
+    srv.mkdir()
+    fail: dict[str, int | str] = {}
+    httpd, url = _serve(srv, fail, None)
+    yield url, srv, fail
+    httpd.shutdown()
+    httpd.server_close()
+
+
+@pytest.fixture()
+def tls_origin(tmp_path: Path):
+    """The same over HTTPS; curl trusts its self-signed cert via CURL_CA_BUNDLE."""
+    srv = tmp_path / "tls-srv"
     srv.mkdir()
     subprocess.run(
         ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", "key.pem", "-out", "cert.pem",
          "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
         check=True, cwd=tmp_path, capture_output=True,
     )
-    httpd, url = _serve(srv, tmp_path)
+    httpd, url = _serve(srv, {}, tmp_path)
     yield url, srv
     httpd.shutdown()
     httpd.server_close()
@@ -134,7 +162,7 @@ def run(
     keyring: Path | None = None,
 ) -> tuple[int, str, str | None]:
     """Run bluefin-ignition-credentials. Returns (returncode, combined output,
-    or the staged user.ign contents, or None if nothing was staged)."""
+    the staged user.ign contents or None if nothing was staged)."""
     out = tmp_path / "run" / "ignition"
     out.mkdir(parents=True)
     env = dict(os.environ, BLUEFIN_IGNITION_OUT=str(out / "user.ign"), CURL_CA_BUNDLE=str(tmp_path / "cert.pem"))
@@ -160,49 +188,94 @@ def run(
     return result.returncode, result.stdout + result.stderr, contents
 
 
+UKI = "/bluefin-server-netboot.efi"
+ALLOW = {"bluefin.ignition.allow-unsigned": "1"}
+
+
 @needs_tools
-def test_signed_node_config_is_staged_inline(tmp_path: Path, origin: tuple[str, Path], keys: dict[str, Path]) -> None:
-    url, srv = origin
+def test_signed_config_over_plain_http_is_staged_verbatim(tmp_path: Path, origin, keys) -> None:
+    url, srv, _ = origin
     _publish(srv, sign_key=keys["release"])
-    rc, log, contents = run(tmp_path, origin_url=url + "/bluefin-server-netboot.efi", keyring=keys["release-ring"])
+    rc, log, contents = run(tmp_path, origin_url=url + UKI, keyring=keys["release-ring"])
     assert rc == 0, log
-    assert contents == CONFIG, "the verified bytes are staged verbatim"
+    assert contents == CONFIG, "the verified bytes are staged, not re-fetched"
     assert "gpgv-verified" in log
 
 
 @needs_tools
-def test_signature_from_another_key_is_refused(tmp_path: Path, origin: tuple[str, Path], keys: dict[str, Path]) -> None:
-    url, srv = origin
-    _publish(srv, sign_key=keys["stranger"])
-    rc, log, contents = run(tmp_path, origin_url=url + "/bluefin-server-netboot.efi", keyring=keys["release-ring"])
-    assert rc == 1, "an unverifiable signature must be refused"
+def test_signed_config_over_https_is_staged_verbatim(tmp_path: Path, tls_origin, keys) -> None:
+    url, srv = tls_origin
+    _publish(srv, sign_key=keys["release"])
+    rc, log, contents = run(tmp_path, origin_url=url + UKI, keyring=keys["release-ring"])
+    assert rc == 0, log
+    assert contents == CONFIG
+
+
+@needs_tools
+def test_http_origin_without_a_config_boots_with_nothing_to_apply(tmp_path: Path, origin, keys) -> None:
+    url, _, _ = origin
+    rc, log, contents = run(tmp_path, origin_url=url + UKI, keyring=keys["release-ring"])
+    assert rc == 0, log
+    assert contents is None
+    assert "nothing to apply" in log
+
+
+@needs_tools
+@pytest.mark.parametrize("damage", ["other-key", "config-changed", "signature-truncated"])
+def test_a_signature_that_does_not_verify_is_refused(tmp_path: Path, origin, keys, damage: str) -> None:
+    url, srv, _ = origin
+    _publish(srv, sign_key=keys["stranger" if damage == "other-key" else "release"])
+    if damage == "config-changed":
+        (srv / "bluefin-node.ign").write_text(CONFIG.replace("/bin/true", "/bin/sh"), encoding="utf-8")
+    if damage == "signature-truncated":
+        sig = srv / "bluefin-node.ign.gpg"
+        sig.write_bytes(sig.read_bytes()[:-8])
+    rc, log, contents = run(tmp_path, origin_url=url + UKI, creds=ALLOW, keyring=keys["release-ring"])
+    assert rc == 1, log
     assert contents is None
     assert "does not verify" in log
 
 
 @needs_tools
-def test_unsigned_node_config_over_https_still_provisions_but_is_flagged(tmp_path: Path, origin: tuple[str, Path], keys: dict[str, Path]) -> None:
-    url, srv = origin
-    _publish(srv, sign_key=None)
-    rc, log, contents = run(tmp_path, origin_url=url + "/bluefin-server-netboot.efi", keyring=keys["release-ring"])
+@pytest.mark.parametrize("scheme", ["http", "HTTP"])
+def test_an_unsigned_config_is_refused_without_the_opt_out(tmp_path: Path, origin, keys, scheme: str) -> None:
+    url, srv, _ = origin
+    _publish(srv)
+    rc, log, contents = run(tmp_path, origin_url=url.replace("http", scheme, 1) + UKI, keyring=keys["release-ring"])
+    assert rc == 1, log
+    assert contents is None
+    assert "bluefin.ignition.allow-unsigned is not set" in log
+
+
+@needs_tools
+def test_an_unsigned_config_is_staged_verbatim_with_the_opt_out(tmp_path: Path, origin, keys) -> None:
+    url, srv, _ = origin
+    _publish(srv)
+    rc, log, contents = run(tmp_path, origin_url=url + UKI, creds=ALLOW, keyring=keys["release-ring"])
     assert rc == 0, log
-    assert contents is not None
-    # no signature served: the config is wrapped in a config.replace of the
-    # https URL, and the run is flagged unauthenticated
-    assert "replace" in contents
-    assert "https://" in contents
+    assert contents == CONFIG
     assert "UNAUTHENTICATED" in log
 
 
 @needs_tools
-def test_plain_http_boot_origin_is_refused(tmp_path: Path, origin: tuple[str, Path], keys: dict[str, Path]) -> None:
-    url, srv = origin
-    _publish(srv)
-    http_origin = url.replace("https://", "http://")
-    rc, log, contents = run(tmp_path, origin_url=http_origin + "/bluefin-server-netboot.efi", keyring=keys["release-ring"])
-    assert rc == 1, "a plain http origin is refused"
+@pytest.mark.parametrize("failure", [500, "drop"])
+def test_a_signature_that_cannot_be_fetched_is_not_a_missing_one(tmp_path: Path, origin, keys, failure) -> None:
+    url, srv, fail = origin
+    _publish(srv, sign_key=keys["release"])
+    fail["/bluefin-node.ign.gpg"] = failure
+    rc, log, contents = run(tmp_path, origin_url=url + UKI, creds=ALLOW, keyring=keys["release-ring"])
+    assert rc == 1, log
     assert contents is None
-    assert "refusing http://" in log
+
+
+@needs_tools
+def test_an_unreadable_keyring_refuses_a_signed_config(tmp_path: Path, origin, keys) -> None:
+    url, srv, _ = origin
+    _publish(srv, sign_key=keys["release"])
+    rc, log, contents = run(tmp_path, origin_url=url + UKI, keyring=tmp_path / "missing.pgp")
+    assert rc == 1, log
+    assert contents is None
+    assert "not readable" in log
 
 
 @needs_tools
@@ -213,21 +286,12 @@ def test_ignition_config_credential_is_staged_inline(tmp_path: Path) -> None:
 
 
 @needs_tools
-def test_http_config_url_credential_is_refused(tmp_path: Path) -> None:
-    rc, log, contents = run(tmp_path, creds={"ignition.config.url": "http://10.0.2.2:8765/bluefin-node.ign"})
-    assert rc == 1, "a plain http config URL is refused"
-    assert contents is None
-    assert "refusing http://" in log
-
-
-@needs_tools
-def test_https_config_url_credential_is_staged_as_replace(origin: tuple[str, Path], tmp_path: Path) -> None:
-    url, _ = origin
-    rc, log, contents = run(tmp_path, creds={"ignition.config.url": url + "/bluefin-node.ign"})
+@pytest.mark.parametrize("url", ["http://10.0.2.2:8765/bluefin-node.ign", "https://10.0.2.2/bluefin-node.ign"])
+def test_config_url_credential_is_staged_as_replace(tmp_path: Path, url: str) -> None:
+    rc, log, contents = run(tmp_path, creds={"ignition.config.url": url})
     assert rc == 0, log
     assert contents is not None
-    assert "replace" in contents
-    assert url + "/bluefin-node.ign" in contents
+    assert '"replace":{"source":"' + url + '"}' in contents
 
 
 @needs_tools

@@ -104,8 +104,9 @@ boot URL in the `StubDeviceURL` EFI variable, and the initrd derives the URL
 of `bluefin-server_<ver>.raw` (and of `SHA256SUMS` / `SHA256SUMS.gpg`) from
 the same directory. `bluefin-ignition-credentials` also uses it: with no
 `ignition.config` / `ignition.config.url` credential it HEADs
-`bluefin-node.ign` next to the UKI and applies it through `config.replace`
-when present. Because HTTP boot skips systemd-boot's key enrollment, the
+`bluefin-node.ign` next to the UKI and, when present and signed, applies the
+verified bytes (see "Per-node configuration" in
+[booty-integration.md](booty-integration.md)). Because HTTP boot skips systemd-boot's key enrollment, the
 firmware must already trust the image DB key; `scripts/dogfood-diskless.sh`
 with `DOGFOOD_BOOT=http` enrolls once from the netboot ESP first.
 
