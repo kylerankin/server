@@ -63,6 +63,11 @@ jobs:
     # track-refs is skipped for non-renovate PRs and pushes; only a failed or
     # cancelled track job should stop the build.
     if: ${{ !failure() && !cancelled() }}
+    # The bst-cache environment's deployment branches are restricted to main
+    # (enforced by GitHub), so on pull_request -- and for fork PRs at all -- its
+    # secrets resolve empty and the upload steps below skip cleanly. This job
+    # runs on both, so the environment is scoped here, not per-step.
+    environment: bst-cache
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     outputs:
@@ -118,6 +123,74 @@ jobs:
           just build-kernel
           just build-zfs
           just export-kernel
+
+      # Upload a safe subset of key-free artifacts to the org CAS so the next
+      # main build starts warm. Gated to pushes on main behind the bst-cache
+      # environment (GitHub enforces its main-only deployment rule); the
+      # environment is never referenced on pull_request, and fork PRs never see
+      # its secrets. The upload config is active only here -- never during
+      # 'bst build' -- so BuildStream never uploads the boot keys.
+      - name: Skip artifact upload when cache credentials are absent
+        if: github.ref == 'refs/heads/main'
+        env:
+          CASD_CLIENT_CERT: ${{ vars.CASD_CLIENT_CERT }}
+          CASD_CLIENT_KEY: ${{ secrets.CASD_CLIENT_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CASD_CLIENT_CERT:-}" ] || [ -z "${CASD_CLIENT_KEY:-}" ]; then
+            echo "::warning::bst-cache credentials not present -- skipping artifact upload (build behaves as before)"
+            exit 0
+          fi
+          echo "Uploading key-free BuildStream artifacts to cache.projectbluefin.io"
+
+      - name: Write mTLS cache credentials
+        if: github.ref == 'refs/heads/main'
+        env:
+          CASD_CLIENT_CERT: ${{ vars.CASD_CLIENT_CERT }}
+          CASD_CLIENT_KEY: ${{ secrets.CASD_CLIENT_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${CASD_CLIENT_CERT}" > client.crt
+          printf '%s\n' "${CASD_CLIENT_KEY}" > client.key
+          chmod 0600 client.crt client.key
+
+      - name: Upload key-free artifacts to the org CAS
+        if: github.ref == 'refs/heads/main'
+        env:
+          CASD_CLIENT_CERT: ${{ vars.CASD_CLIENT_CERT }}
+          CASD_CLIENT_KEY: ${{ secrets.CASD_CLIENT_KEY }}
+        run: |
+          set -euo pipefail
+
+          # Push-only config: :11002 with mTLS, pull-only elsewhere. Active only
+          # in this post-build step, never during 'bst build'.
+          cat > buildstream-ci.conf <<EOF
+          artifacts:
+            servers:
+            - url: https://cache.projectbluefin.io:11002
+              push: true
+              connection-config:
+                keepalive-time: 180
+                retry-limit: 5
+                retry-delay: 1000
+                request-timeout: 180
+              auth:
+                client-key: /src/client.key
+                client-cert: /src/client.crt
+          EOF
+
+          # Fails closed (non-zero) if any allow-listed element is key-derived.
+          ELEMENTS="$(python3 .github/scripts/bst-push-elements.py)"
+          if [ -z "${ELEMENTS}" ]; then
+            echo "::warning::no key-free elements resolved -- skipping upload"
+            exit 0
+          fi
+
+          echo "Uploading key-free artifacts to cache.projectbluefin.io:11002"
+          echo "${ELEMENTS}"
+          # shellcheck disable=SC2086
+          just bst --config /src/buildstream-ci.conf push ${ELEMENTS}
+
       - name: Sign release SHA256SUMS manifest
         if: github.ref == 'refs/heads/main'
         env:
