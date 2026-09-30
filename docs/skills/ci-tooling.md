@@ -67,8 +67,14 @@ may hold a write token. `contents: write` is granted per job only to:
   `refs/heads/main`.
 
 The `build` job (validation, compile, signing) runs with the read-only default
-on every event. If a new job needs additional permissions, keep them as narrow
-as possible and document why.
+on every event and never carries the org CAS credential. The `artifact-push`
+job (`build.yml`) is the only job that holds a non-token credential: it runs
+only on `refs/heads/main` (a `needs: build` order plus an `if:` ref guard),
+carries the `bst-cache` environment with the `CASD_CLIENT_CERT`/`CASD_CLIENT_KEY`
+mTLS pair, and pushes a key-free subset of BuildStream artifacts to
+`cache.projectbluefin.io:11002`. It never executes PR-controlled code, so the
+credential is never exposed to a `pull_request`. If a new job needs additional
+permissions or a credential, keep them as narrow as possible and document why.
 
 ### `sudo` scope
 
@@ -96,6 +102,7 @@ sudo_cmd := if `podman info >/dev/null 2>&1 && echo 1 || echo 0` == "1" { "" } e
 |-----|----------|---------|---------|
 | `track-refs` | `build.yml` | `pull_request` (`renovate/*` only) | Resolves BuildStream junction refs and pushes them back to the PR branch. Sole `contents: write` grant on `pull_request`. |
 | `build` | `build.yml` | `pull_request`, `push/main`, `workflow_dispatch` | Resolves the element graph, runs the full BuildStream compile (including Flatcar LTS Kernel & ZFS), and signs the release manifest on pushes to `main`. Read-only token. |
+| `artifact-push` | `build.yml` | `push/main` only (`if:` ref guard + `needs: build`) | Warms the org CAS by pushing a key-free subset of BuildStream artifacts to `cache.projectbluefin.io:11002` over mTLS (`bst-cache` environment). Downloads the artifact cache `build` uploads. Never runs on `pull_request`. |
 | `release` | `build.yml` | `push/main`, `workflow_dispatch` | Downloads the signed assets handed off by `build` and publishes them to the GitHub Release (`if: ${{ !failure() && !cancelled() && github.ref == 'refs/heads/main' }}`). `contents: write`. |
 | `build-kernel` | `kernel.yml` | `pull_request` (paths: `elements/flatcar/**`, `include/flatcar.yml`, `patches/flatcar-kernel/**`), `push/main`, `workflow_dispatch` | Standalone kernel & OpenZFS sysext BuildStream build and export. Emits `dist/kernel/` artifacts. Read-only token. |
 | `docs` | `docs-checks.yml` | `pull_request`, `push/main` | Runs markdown and skill metadata checks via `docs-checks.py`. Read-only token. |

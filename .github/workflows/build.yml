@@ -63,11 +63,10 @@ jobs:
     # track-refs is skipped for non-renovate PRs and pushes; only a failed or
     # cancelled track job should stop the build.
     if: ${{ !failure() && !cancelled() }}
-    # The bst-cache environment's deployment branches are restricted to main
-    # (enforced by GitHub), so on pull_request -- and for fork PRs at all -- its
-    # secrets resolve empty and the upload steps below skip cleanly. This job
-    # runs on both, so the environment is scoped here, not per-step.
-    environment: bst-cache
+    # Runs on both pull_request and main and executes PR-controlled code, so it
+    # must never carry the bst-cache environment (its main-only deployment rule
+    # would reject every PR build). The mTLS push credential lives in the
+    # dedicated artifact-push job below, which only ever runs on main.
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     outputs:
@@ -124,72 +123,19 @@ jobs:
           just build-zfs
           just export-kernel
 
-      # Upload a safe subset of key-free artifacts to the org CAS so the next
-      # main build starts warm. Gated to pushes on main behind the bst-cache
-      # environment (GitHub enforces its main-only deployment rule); the
-      # environment is never referenced on pull_request, and fork PRs never see
-      # its secrets. The upload config is active only here -- never during
-      # 'bst build' -- so BuildStream never uploads the boot keys.
-      - name: Skip artifact upload when cache credentials are absent
+      # Upload the freshly-built BuildStream artifact cache so the dedicated
+      # artifact-push job below can warm the org CAS. Gated to main so the
+      # private cache never attaches to a PR run. The push job restores it and
+      # runs 'bst artifact push'; this job only ever transfers already-built,
+      # key-free elements (never the boot keys).
+      - name: Upload built artifact cache for warming
         if: github.ref == 'refs/heads/main'
-        env:
-          CASD_CLIENT_CERT: ${{ vars.CASD_CLIENT_CERT }}
-          CASD_CLIENT_KEY: ${{ secrets.CASD_CLIENT_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CASD_CLIENT_CERT:-}" ] || [ -z "${CASD_CLIENT_KEY:-}" ]; then
-            echo "::warning::bst-cache credentials not present -- skipping artifact upload (build behaves as before)"
-            exit 0
-          fi
-          echo "Uploading key-free BuildStream artifacts to cache.projectbluefin.io"
-
-      - name: Write mTLS cache credentials
-        if: github.ref == 'refs/heads/main'
-        env:
-          CASD_CLIENT_CERT: ${{ vars.CASD_CLIENT_CERT }}
-          CASD_CLIENT_KEY: ${{ secrets.CASD_CLIENT_KEY }}
-        run: |
-          set -euo pipefail
-          printf '%s\n' "${CASD_CLIENT_CERT}" > client.crt
-          printf '%s\n' "${CASD_CLIENT_KEY}" > client.key
-          chmod 0600 client.crt client.key
-
-      - name: Upload key-free artifacts to the org CAS
-        if: github.ref == 'refs/heads/main'
-        env:
-          CASD_CLIENT_CERT: ${{ vars.CASD_CLIENT_CERT }}
-          CASD_CLIENT_KEY: ${{ secrets.CASD_CLIENT_KEY }}
-        run: |
-          set -euo pipefail
-
-          # Push-only config: :11002 with mTLS, pull-only elsewhere. Active only
-          # in this post-build step, never during 'bst build'.
-          cat > buildstream-ci.conf <<EOF
-          artifacts:
-            servers:
-            - url: https://cache.projectbluefin.io:11002
-              push: true
-              connection-config:
-                keepalive-time: 180
-                retry-limit: 5
-                retry-delay: 1000
-                request-timeout: 180
-              auth:
-                client-key: /src/client.key
-                client-cert: /src/client.crt
-          EOF
-
-          # Fails closed (non-zero) if any allow-listed element is key-derived.
-          ELEMENTS="$(python3 .github/scripts/bst-push-elements.py)"
-          if [ -z "${ELEMENTS}" ]; then
-            echo "::warning::no key-free elements resolved -- skipping upload"
-            exit 0
-          fi
-
-          echo "Uploading key-free artifacts to cache.projectbluefin.io:11002"
-          echo "${ELEMENTS}"
-          # shellcheck disable=SC2086
-          just bst --config /src/buildstream-ci.conf push ${ELEMENTS}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bst-artifact-cache
+          path: ~/.cache/buildstream/
+          if-no-files-found: warn
+          retention-days: 1
 
       - name: Sign release SHA256SUMS manifest
         if: github.ref == 'refs/heads/main'
@@ -230,6 +176,87 @@ jobs:
           path: dist/release/
           if-no-files-found: error
           retention-days: 1
+
+  # Warms the org CAS with a safe subset of key-free BuildStream artifacts so
+  # the next main build starts warm. Runs only on main (needs: build + the if
+  # guard), carries the bst-cache environment and its mTLS credential, and
+  # never executes PR-controlled code. The build job transfers its freshly
+  # built artifact cache; this job restores it and pushes the allow-listed
+  # elements.
+  artifact-push:
+    needs: build
+    # needs: build only orders this job after the build; the ref guard is what
+    # makes it main-only. Without `github.ref == 'refs/heads/main'` the job
+    # would also run on pull_request and the bst-cache credential would leak to
+    # PR-controlled code. Both together: wait for a real build, run only on main.
+    if: ${{ !failure() && !cancelled() && github.ref == 'refs/heads/main' }}
+    environment: bst-cache
+    runs-on: ubuntu-24.04
+    env:
+      CASD_CLIENT_CERT: ${{ vars.CASD_CLIENT_CERT }}
+      CASD_CLIENT_KEY: ${{ secrets.CASD_CLIENT_KEY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          repository: ${{ github.repository }}
+
+      - name: Set up just
+        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2
+        with:
+          tool: just
+
+      - name: Restore built artifact cache
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: bst-artifact-cache
+          path: "${HOME}/.cache/buildstream"
+          if-no-files-found: warn
+
+      - name: Write mTLS cache credentials
+        run: |
+          set -euo pipefail
+          if [ -z "${CASD_CLIENT_CERT:-}" ] || [ -z "${CASD_CLIENT_KEY:-}" ]; then
+            echo "::warning::bst-cache credentials not present -- skipping artifact upload (build behaves as before)"
+            exit 0
+          fi
+          printf '%s\n' "${CASD_CLIENT_CERT}" > client.crt
+          printf '%s\n' "${CASD_CLIENT_KEY}" > client.key
+          chmod 0600 client.crt client.key
+
+      - name: Upload key-free artifacts to the org CAS
+        run: |
+          set -euo pipefail
+
+          # Push-only config: :11002 with mTLS, pull-only elsewhere. Active only
+          # in this post-build step, never during 'bst build'.
+          cat > buildstream-ci.conf <<EOF
+          artifacts:
+            servers:
+            - url: https://cache.projectbluefin.io:11002
+              push: true
+              connection-config:
+                keepalive-time: 180
+                retry-limit: 5
+                retry-delay: 1000
+                request-timeout: 180
+              auth:
+                client-key: /src/client.key
+                client-cert: /src/client.crt
+          EOF
+
+          # Fails closed (non-zero) if any allow-listed element is key-derived.
+          ELEMENTS="$(python3 .github/scripts/bst-push-elements.py)"
+          if [ -z "${ELEMENTS}" ]; then
+            echo "::warning::no key-free elements resolved -- skipping upload"
+            exit 0
+          fi
+
+          echo "Uploading key-free artifacts to cache.projectbluefin.io:11002"
+          echo "${ELEMENTS}"
+          # shellcheck disable=SC2086
+          just bst --config /src/buildstream-ci.conf artifact push ${ELEMENTS}
 
   # Publishes the signed assets to the GitHub Release. Only runs on
   # pushes/dispatches to main, where the code is already reviewed, and is the
