@@ -56,8 +56,9 @@ but never newer. Patch releases change neither constraint.
 - **Patches** are automatic. `.github/workflows/track-binaries.yml` opens one
   pull request per component (Kubernetes, cri-tools, containerd, runc, CNI
   plugins) when a newer patch of its pinned series is out, with the version
-  and its sha256 refs changed together and checked against the checksum files
-  upstream publishes.
+  and its sha256 refs (amd64 and arm64) changed together and checked against
+  the checksum files upstream publishes. A release missing either
+  architecture's asset or checksum is not proposed.
 - **Minors** are manual, once the cluster's control plane runs the new minor:
   1. `python3 .github/scripts/track-binaries.py apply kubernetes --version X.Y.Z`,
      and the same for `cri-tools` (its minor follows Kubernetes). `apply`
@@ -126,7 +127,8 @@ what democratic-csi's `chroot /host ... iscsiadm` node plugin needs.
 
 ## Known gaps
 
-- x86_64 only (amd64 release binaries).
+- aarch64: the arm64 release binaries are pinned, but no aarch64 image has
+  been built or booted.
 
 ## Verify
 

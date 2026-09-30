@@ -48,10 +48,16 @@ def load_transfer(path: Path) -> configparser.ConfigParser:
 
 
 def element_texts() -> str:
-    """Every element definition concatenated, for artifact-name lookups."""
-    return "\n".join(
+    """Every element definition concatenated, for artifact-name lookups.
+
+    Sysext elements name their image in ``sysext-image:`` and
+    ``include/sysext.yml`` writes ``%{sysext-image}.raw``; spell that out.
+    """
+    text = "\n".join(
         p.read_text() for p in sorted(ELEMENTS_DIR.rglob("*.bst"))
     )
+    images = re.findall(r'^\s*sysext-image:\s*"([^"]+)"', text, re.MULTILINE)
+    return "\n".join([text, *(f"{image}.raw" for image in images)])
 
 
 def split_match_pattern(pattern: str) -> tuple[str, str]:
@@ -261,7 +267,9 @@ def test_every_source_artifact_is_in_the_signed_image_set(path: Path):
     image = IMAGE_ELEMENT.read_text()
     assert prefix in image, f"{path.name}: {prefix!r} assets are not in {IMAGE_ELEMENT.name}"
     build_yml = (REPO_ROOT / ".github" / "workflows" / "build.yml").read_text()
-    assert "find dist/diskless -maxdepth 1 -type f" in build_yml
+    assert "scripts/publish-release.sh release dist/diskless" in build_yml
+    publish = (REPO_ROOT / "scripts" / "publish-release.sh").read_text()
+    assert "-maxdepth 1 -type f" in publish
     assert "gpg --batch --yes --pinentry-mode loopback" in image
     assert "gpgv --keyring /boot-keys/import-pubring.pgp SHA256SUMS.gpg SHA256SUMS" in image
 

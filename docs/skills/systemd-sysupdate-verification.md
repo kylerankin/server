@@ -22,11 +22,12 @@ the OS image.
 - Rotating or replacing the image signing key.
 - Debugging `systemd-sysupdate` or diskless `rd.systemd.pull` failures related
   to `SHA256SUMS.gpg` verification.
+- Verifying a published release: provenance attestations and the SBOM.
 
 ## When NOT to Use
 
 - General BuildStream element or dependency questions (use `avoid-over-engineering` or `ddi-installer`).
-- SBOM or container-image signing questions (use `signing-and-sbom`).
+- CI job wiring, permissions and action pins (use `ci-tooling`).
 
 ## How It Works
 
@@ -99,15 +100,71 @@ keyring (`bluefin-server/initrd/initrd-stack.bst` depends on
 DDI and a re-hashed, unsigned manifest alike (`DOGFOOD_TAMPER=raw|sums`
 proves both).
 
+## Provenance, SBOM and publishing
+
+The GPG signature is what nodes check. On top of it, every release carries
+GitHub artifact attestations (SLSA build provenance, signed keylessly through
+Sigstore with the `build.yml` workflow identity on `refs/heads/main`) that
+tell a human or a policy engine which commit and workflow run produced it.
+
+- **SBOM.** `oci/bluefin-server-sbom.bst` runs FSDK's `collect_manifest`
+  plugin (`output-type: spdx`) over the payload of the release set: the /usr
+  and initrd stacks, the kernel, and the k0s, KubeStellar, kubeadm and
+  OpenZFS sysext payloads. It lists one SPDX package per source (name,
+  version, download URL, source kind). Build-only elements such as the
+  signing keys are not runtime dependencies of that payload and never
+  appear. The image element stamps `creationInfo.created` and ships it as
+  `bluefin-server_<ver>.spdx.json`, listed in `SHA256SUMS`, so the GPG
+  signature covers it too. No transfer matches it, so nodes never download it.
+- **Publishing.** `scripts/publish-release.sh` is the only publish path.
+  `verify` checks what nodes will check (`gpgv` against the keyring, every
+  `SHA256SUMS` entry present and matching), plus: every published file is
+  listed, every file name carries the release version, and the SBOM is valid
+  SPDX 2.3. `release` creates the GitHub Release at the built commit. `oci`
+  pushes the ORAS artifact, then checks the registry manifest layer by layer
+  against the local files. On main the `release` job verifies against the
+  committed `files/os/sysupdate-keys/import-pubring.gpg`. On pull requests
+  `release-dry-run` verifies against the throwaway keyring the build
+  exported in `sysupdate-keys/`, prints the `gh release create` command, and
+  pushes to a local registry and pulls the artifact back.
+- **Attestations.** The `release` job runs `actions/attest` four times:
+  provenance and SBOM for every published file (subjects are the verified
+  checksums), and provenance and SBOM for the OCI artifact digest with
+  `push-to-registry: true`, which stores the Sigstore bundles next to the
+  artifact as OCI referrers. That bundle is the registry signature. A
+  separate `cosign sign` would only repeat the same workflow identity, so
+  there is none.
+
+Verify a downloaded file, or the OCI artifact, with the GitHub CLI:
+
+```bash
+gh attestation verify bluefin-server_<ver>.raw --repo projectbluefin/server \
+  --signer-workflow projectbluefin/server/.github/workflows/build.yml --source-ref refs/heads/main
+gh attestation verify bluefin-server_<ver>.raw --repo projectbluefin/server \
+  --predicate-type https://spdx.dev/Document/v2.3
+gh attestation verify oci://ghcr.io/projectbluefin/bluefin-server:<ver> \
+  --repo projectbluefin/server --bundle-from-oci
+```
+
+Or with cosign, against the referrers stored in the registry:
+
+```bash
+cosign verify-attestation --new-bundle-format --type slsaprovenance1 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity 'https://github.com/projectbluefin/server/.github/workflows/build.yml@refs/heads/main' \
+  ghcr.io/projectbluefin/bluefin-server@sha256:<digest>
+```
+
+Use `--type spdxjson` to get the SBOM attestation instead.
+
 ## Repository Layout
 
 - `files/os/sysupdate-keys/import-pubring.gpg` — the release public keyring,
   committed. On release builds CI copies it to
   `files/boot-keys/import-pubring.pgp`.
 - `files/boot-keys/sysupdate-signing.asc` / `import-pubring.pgp` — the signing
-  key and public keyring for a build (gitignored). Locally `just gen-dev-keys`
-  generates a dev key; on main CI writes them from the `SYSUPDATE_SIGNING_KEY`
-  secret plus the committed release keyring.
+  key and public keyring for a build (gitignored). Where they come from
+  locally and in CI: [secure-boot-keys.md](secure-boot-keys.md).
 - `elements/bluefin-server/os-sysupdate-keys.bst` — installs
   `files/boot-keys/import-pubring.pgp` as `/etc/systemd/import-pubring.pgp`.
 - `files/os/sysupdate.d/*.transfer` and the k0s component directory
@@ -140,12 +197,14 @@ proves both).
    ```
 2. Update the GitHub Actions repository secret `SYSUPDATE_SIGNING_KEY` with the
    new ASCII-armored private key.
-3. Rebuild and publish a release. Existing hosts will only trust updates signed
-   by the new key, so plan the rotation around a release boundary.
+3. Rebuild and publish a release under a new `image-version` (a key rotation
+   is never a rebuild of an existing version; see
+   "Keys" in [ddi-installer-build.md](ddi-installer-build.md)). Existing hosts only
+   trust updates signed by the key in their keyring, so plan the rotation
+   around a release boundary.
 
-For a throwaway local signing key, `just gen-dev-keys` writes
-`files/boot-keys/sysupdate-signing.asc` and `files/boot-keys/import-pubring.pgp`
-on its own; no manual gpg step is needed.
+For a throwaway local signing key, `just gen-dev-keys` writes the pair on its
+own; see [secure-boot-keys.md](secure-boot-keys.md).
 
 ## Common Gotchas
 
@@ -182,6 +241,10 @@ on its own; no manual gpg step is needed.
       proves it with `gpgv` against the keyring the image ships.
 - [ ] CI publishes `dist/diskless/` as-is to the GitHub Release and to the
       OCI artifact; there is no separate signing step.
+- [ ] Every publish command in `build.yml` goes through
+      `scripts/publish-release.sh`, and `release-dry-run` runs the same
+      `verify`, `release --dry-run` and `oci` commands on pull requests.
+- [ ] `bluefin-server_<ver>.spdx.json` is listed in `SHA256SUMS`.
 - [ ] Every transfer in `files/os/sysupdate.d/*.transfer` and the k0s
       component directory uses a static `Path=` with no `@v` placeholder.
 - [ ] Every transfer uses `@v` only inside `MatchPattern=`.
