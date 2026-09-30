@@ -24,6 +24,9 @@ UNITS = ROOT / "files" / "initrd" / "usr" / "lib" / "systemd" / "system"
 IGN_UNITS = ROOT / "files" / "initrd-ignition" / "usr" / "lib" / "systemd" / "system"
 HELPER = ROOT / "files" / "initrd" / "usr" / "libexec" / "bluefin-boot-diagnostics"
 BOOT = ROOT / "elements" / "oci" / "bluefin-server-boot.bst"
+INSTALLER_DROPIN = (
+    ROOT / "files" / "os" / "systemd" / "system" / "systemd-sysinstall.service.d" / "10-bluefin-installer.conf"
+)
 MIB = 1024 * 1024
 IMPORT_UNIT = "systemd-import@run-machines-rootdisk.raw.service"
 
@@ -91,6 +94,22 @@ def test_ignition_karg_warning_runs_in_every_initrd() -> None:
 def test_ignition_failures_reach_the_summary(stage: str) -> None:
     u = unit(IGN_UNITS / f"ignition-{stage}.service")
     assert u["Unit"]["OnFailure"] == ["emergency.target"]
+
+
+def test_installer_shows_failure_on_the_console_before_halting() -> None:
+    # On two-NVMe hardware (#308) sysinstall can fail after it starts erasing
+    # the target. --mute-console=yes hides sysinstall's own error and the
+    # initrd silences the journal on the console, so the failure would be
+    # invisible with the disk left blank. Run the boot-failure diagnostics, which
+    # prints the failed units and sysinstall's journal lines to the console
+    # (bypassing both), waits bluefin.failure_delay, then halts as before.
+    u = unit(INSTALLER_DROPIN)
+    assert u["Unit"]["RequiresMountsFor"] == ["/run/bluefin/installer"]
+    assert u["Unit"]["SuccessAction"] == ["reboot"]
+    assert u["Service"]["FailureExecStart"] == [
+        "/usr/libexec/bluefin-boot-diagnostics failure-summary"
+    ]
+    assert u["Unit"]["FailureAction"] == ["halt"]
 
 
 def test_helper_is_executable_bash_without_sed_or_awk() -> None:

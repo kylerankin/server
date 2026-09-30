@@ -82,8 +82,17 @@ upstream does not accept — a typo, an out-of-range number — is rejected with
 `Invalid input …` and the same prompt is asked again, so a mistyped answer
 never halts the machine. After a cancel or a real install failure, upstream's
 `FailureAction=halt` halts the machine — it stops at `System halted` with the
-message still on screen, but does not power off. Power-cycle and boot the stick
-again to retry.
+message still on screen, but does not power off. A real install failure is the
+trap: `--mute-console=yes` mutes sysinstall's own error and the initrd silences
+the journal on the console, so the failure would be invisible and, once the halt
+fired, the RAM log gone. The drop-in (`10-bluefin-installer.conf`) sets
+`FailureExecStart=/usr/libexec/bluefin-boot-diagnostics failure-summary`, which
+runs **before** the halt: it prints the failed units, sysinstall's journal lines
+and a hint straight to the console (bypassing `--mute-console` and journald's
+console silence), waits `bluefin.failure_delay` (default 60 s) so it can be
+read, then halts as before. Read the reason, power-cycle and boot the stick
+again to retry. On two-NVMe hardware (#308) this is what turns a blank disk with
+no error into a visible reason to retry.
 
 The installed disk is identical to one a diskless node installs: stock
 `systemd-sysinstall` with the layout from `files/os/repart.d/` (see
