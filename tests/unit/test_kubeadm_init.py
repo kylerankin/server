@@ -36,6 +36,7 @@ ADMIN_CONF = "/etc/kubernetes/admin.conf"
 SHARE = "/usr/share/bluefin/kubeadm"
 CRI_SOCKET = "unix:///run/containerd/containerd.sock"
 TAINT = "node-role.kubernetes.io/control-plane:NoSchedule"
+LABEL = "exclude-from-external-load-balancers"
 
 
 def kubernetes_version() -> str:
@@ -149,15 +150,29 @@ def run_init(tmp_path: Path):
     Returns ``(returncode, calls, kubeconfig link)``; each call is one argv.
     """
 
-    def run(*, init_rc: int = 0, taints: str = TAINT.split(":")[0]) -> tuple[int, list[list[str]], Path]:
+    def run(
+        *,
+        init_rc: int = 0,
+        taints: str = TAINT.split(":")[0],
+        metallb_label: str = LABEL,
+    ) -> tuple[int, list[list[str]], Path]:
         stubs = tmp_path / "bin"
         stubs.mkdir(exist_ok=True)
         calls = tmp_path / "calls"
         calls.write_text("", encoding="utf-8")
+        # The labels query echoes a JSON map carrying the label key when the
+        # node carries it, and an empty map when it does not.
+        labels_json = ('{"' + metallb_label + '":"true"}') if metallb_label else "{}"
+        kubectl = (
+            '[ "$1" = get ] && case "$*" in'
+            ' *taints*) echo "' + taints + '";;'
+            ' *labels*) echo "' + labels_json + '";;'
+            ' esac'
+        )
         for tool, body in {
             "systemctl": "",
             "kubeadm": f'[ "$1" = init ] && exit {init_rc}',
-            "kubectl": f'[ "$1" = get ] && echo "{taints}"',
+            "kubectl": kubectl,
         }.items():
             (stubs / tool).write_text(
                 f'#!/bin/sh\nprintf "%s\\0" {tool} "$@" >> "$CALLS"; printf "\\n" >> "$CALLS"\n{body}\nexit 0\n',
@@ -184,8 +199,9 @@ def test_init_enables_kubelet_skips_kube_proxy_untaints_and_links_kubeconfig(run
     enable = ["systemctl", "enable", "containerd.service", "kubelet.service"]
     init = ["kubeadm", "init", "--config", ETC_CONFIG, "--skip-phases=addon/kube-proxy"]
     untaint = ["kubectl", "taint", "nodes", "--all", f"{TAINT}-"]
+    unlabel = ["kubectl", "label", "nodes", "--all", f"{LABEL}-"]
     assert enable in calls and init in calls and untaint in calls
-    assert calls.index(enable) < calls.index(init) < calls.index(untaint)
+    assert calls.index(enable) < calls.index(init) < calls.index(untaint) < calls.index(unlabel)
     assert not [c for c in calls if c[:2] == ["kubeadm", "reset"]]
     assert kubeconfig.is_symlink() and os.readlink(kubeconfig) == ADMIN_CONF
     assert oct(kubeconfig.parent.stat().st_mode & 0o777) == "0o700"
@@ -195,6 +211,21 @@ def test_init_leaves_an_untainted_node_alone(run_init) -> None:
     rc, calls, _ = run_init(taints="example.com/other")
     assert rc == 0
     assert not [c for c in calls if c[:2] == ["kubectl", "taint"]]
+
+
+def test_init_removes_the_metallb_exclude_label(run_init) -> None:
+    # MetalLB marks a single node exclude-from-external-load-balancers, so an
+    # external LoadBalancer Service would never reach the only worker without
+    # this.
+    rc, calls, _ = run_init()
+    assert rc == 0
+    assert ["kubectl", "label", "nodes", "--all", f"{LABEL}-"] in calls
+
+
+def test_init_leaves_a_node_without_the_label_alone(run_init) -> None:
+    rc, calls, _ = run_init(metallb_label="")
+    assert rc == 0
+    assert not [c for c in calls if c[:2] == ["kubectl", "label"]]
 
 
 def test_failed_init_resets_so_the_retry_is_not_skipped(run_init) -> None:

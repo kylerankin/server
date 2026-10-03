@@ -23,8 +23,14 @@ fi
 install -d -m 0700 /root/.kube
 ln -sfn "${admin}" /root/.kube/config
 
-# One node runs everything: drop the taint kubeadm put on it.
+# One node runs everything: drop the taint kubeadm put on it, and the
+# exclude-from-external-load-balancers label MetalLB adds to a single node
+# so an external LoadBalancer Service can reach the only worker.
 export KUBECONFIG="${admin}"
 if kubectl get nodes -o jsonpath='{.items[*].spec.taints[*].key}' | tr ' ' '\n' | grep -qx "${taint%%:*}"; then
     kubectl taint nodes --all "${taint}-"
+fi
+if kubectl get nodes -o jsonpath='{.items[*].metadata.labels}' 2>/dev/null \
+        | grep -q 'exclude-from-external-load-balancers'; then
+    kubectl label nodes --all exclude-from-external-load-balancers-
 fi

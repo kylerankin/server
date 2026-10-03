@@ -185,6 +185,8 @@ workloads. Opt-in: nothing enables it, and a worker never sees its config.
      (Cilium replaces kube-proxy, and kubeadm records `proxy.disabled`)
   3. links `/root/.kube/config` to `admin.conf`
   4. removes the `node-role.kubernetes.io/control-plane:NoSchedule` taint
+  5. removes the `exclude-from-external-load-balancers` label MetalLB adds to
+     the single node, so an external LoadBalancer Service can reach it
 
   A failed `kubeadm init` runs `kubeadm reset --force` because a leftover
   `admin.conf` would skip every retry. The unit then retries
