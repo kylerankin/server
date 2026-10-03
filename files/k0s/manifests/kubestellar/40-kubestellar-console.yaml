@@ -66,6 +66,16 @@ spec:
               name: kubestellar-console-github-oauth
               key: jwt-secret
               optional: false
+        # The upstream Console image bakes its frontend URL to a plaintext
+        # localhost default at build time, so the backend keeps issuing http
+        # links and OAuth redirects even though the console is only reachable
+        # here over the TLS-terminating kiosk proxy. Override it with the https
+        # origin the kiosk proxy presents; leaving this unset reproduces the
+        # refresh loop against basic auth. LAN / production access needs a
+        # different value through the operator's own TLS front end, which is
+        # out of scope for the in-box kiosk flow.
+        - name: FRONTEND_URL
+          value: "https://127.0.0.1:8080"
         ports:
         - containerPort: 8080
           name: http

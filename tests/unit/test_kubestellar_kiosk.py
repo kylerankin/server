@@ -92,6 +92,18 @@ def test_console_provides_local_and_oauth_login_options() -> None:
     assert "optional: true" in console
 
 
+def test_console_frontend_url_is_https_not_baked_http() -> None:
+    console = CONSOLE_MANIFEST.read_text(encoding="utf-8")
+
+    # The upstream Console image bakes its frontend URL to a plaintext
+    # localhost default at build time; without an override the backend keeps
+    # issuing http:// links and OAuth redirects, which loops against the
+    # kiosk proxy's TLS termination.
+    assert "name: FRONTEND_URL" in console
+    assert 'value: "https://127.0.0.1:8080"' in console
+    assert "value: \"http://" not in console
+
+
 def test_proxy_is_the_only_public_console_endpoint() -> None:
     proxy = PROXY_MANIFEST.read_text(encoding="utf-8")
 
