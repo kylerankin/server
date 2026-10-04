@@ -36,7 +36,9 @@ ADMIN_CONF = "/etc/kubernetes/admin.conf"
 SHARE = "/usr/share/bluefin/kubeadm"
 CRI_SOCKET = "unix:///run/containerd/containerd.sock"
 TAINT = "node-role.kubernetes.io/control-plane:NoSchedule"
-LABEL = "exclude-from-external-load-balancers"
+# kubeadm's LabelExcludeFromExternalLB, which its mark-control-plane phase puts
+# on a control plane next to TAINT; MetalLB's speakers skip a node carrying it.
+LABEL = "node.kubernetes.io/exclude-from-external-load-balancers"
 
 
 def kubernetes_version() -> str:
@@ -154,19 +156,23 @@ def run_init(tmp_path: Path):
         *,
         init_rc: int = 0,
         taints: str = TAINT.split(":")[0],
-        metallb_label: str = LABEL,
+        nodes: tuple[str, ...] = ("cp",),
+        labelled: tuple[str, ...] = ("cp",),
     ) -> tuple[int, list[list[str]], Path]:
         stubs = tmp_path / "bin"
         stubs.mkdir(exist_ok=True)
         calls = tmp_path / "calls"
         calls.write_text("", encoding="utf-8")
-        # The labels query echoes a JSON map carrying the label key when the
-        # node carries it, and an empty map when it does not.
-        labels_json = ('{"' + metallb_label + '":"true"}') if metallb_label else "{}"
+
+        def names(items: tuple[str, ...]) -> str:
+            return "printf '" + "".join(f"node/{n}\\n" for n in items) + "'"
+
+        # Only a selector on exactly LABEL finds the `labelled` nodes.
         kubectl = (
             '[ "$1" = get ] && case "$*" in'
-            ' *taints*) echo "' + taints + '";;'
-            ' *labels*) echo "' + labels_json + '";;'
+            f' *taints*) echo "{taints}";;'
+            f' "get nodes -l {LABEL} -o name") {names(labelled)};;'
+            f' "get nodes -o name") {names(nodes)};;'
             ' esac'
         )
         for tool, body in {
@@ -199,9 +205,8 @@ def test_init_enables_kubelet_skips_kube_proxy_untaints_and_links_kubeconfig(run
     enable = ["systemctl", "enable", "containerd.service", "kubelet.service"]
     init = ["kubeadm", "init", "--config", ETC_CONFIG, "--skip-phases=addon/kube-proxy"]
     untaint = ["kubectl", "taint", "nodes", "--all", f"{TAINT}-"]
-    unlabel = ["kubectl", "label", "nodes", "--all", f"{LABEL}-"]
     assert enable in calls and init in calls and untaint in calls
-    assert calls.index(enable) < calls.index(init) < calls.index(untaint) < calls.index(unlabel)
+    assert calls.index(enable) < calls.index(init) < calls.index(untaint)
     assert not [c for c in calls if c[:2] == ["kubeadm", "reset"]]
     assert kubeconfig.is_symlink() and os.readlink(kubeconfig) == ADMIN_CONF
     assert oct(kubeconfig.parent.stat().st_mode & 0o777) == "0o700"
@@ -213,17 +218,25 @@ def test_init_leaves_an_untainted_node_alone(run_init) -> None:
     assert not [c for c in calls if c[:2] == ["kubectl", "taint"]]
 
 
-def test_init_removes_the_metallb_exclude_label(run_init) -> None:
-    # MetalLB marks a single node exclude-from-external-load-balancers, so an
-    # external LoadBalancer Service would never reach the only worker without
-    # this.
+def test_init_lets_load_balancers_reach_the_only_node(run_init) -> None:
+    # With the label, MetalLB announces no LoadBalancer address from the
+    # cluster's only node (#371).
     rc, calls, _ = run_init()
     assert rc == 0
-    assert ["kubectl", "label", "nodes", "--all", f"{LABEL}-"] in calls
+    untaint = ["kubectl", "taint", "nodes", "--all", f"{TAINT}-"]
+    unlabel = ["kubectl", "label", "node/cp", f"{LABEL}-"]
+    assert unlabel in calls and calls.index(untaint) < calls.index(unlabel)
+    assert [c for c in calls if c[:2] == ["kubectl", "label"]] == [unlabel]
 
 
 def test_init_leaves_a_node_without_the_label_alone(run_init) -> None:
-    rc, calls, _ = run_init(metallb_label="")
+    rc, calls, _ = run_init(labelled=())
+    assert rc == 0
+    assert not [c for c in calls if c[:2] == ["kubectl", "label"]]
+
+
+def test_init_keeps_the_label_once_the_cluster_has_other_nodes(run_init) -> None:
+    rc, calls, _ = run_init(nodes=("cp", "worker"))
     assert rc == 0
     assert not [c for c in calls if c[:2] == ["kubectl", "label"]]
 
