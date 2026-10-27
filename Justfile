@@ -39,6 +39,21 @@ bst *ARGS:
     if [ -s /run/systemd/resolve/resolv.conf ]; then
         resolv_args=(-v /run/systemd/resolve/resolv.conf:/etc/resolv.conf:ro)
     fi
+    # Fail fast with a clear message when the bst2 tag was never published (a
+    # failed upstream build leaves it 'manifest unknown') instead of letting
+    # podman fail deep inside a build. Skip the pull when the image is already
+    # cached locally.
+    if ! {{sudo_cmd}} podman image exists "${{bst2_image}}" >/dev/null 2>&1; then
+        if ! {{sudo_cmd}} podman pull --quiet "${{bst2_image}}" 2>"${HOME}/.cache/bst2-pull.err"; then
+            echo "ERROR: could not pull bst2 image '${{bst2_image}}'." >&2
+            sed 's/^/    /' "${HOME}/.cache/bst2-pull.err" >&2 || true
+            echo "    The tag was likely never published by the FSDK build pipeline" >&2
+            echo "    (a failed upstream build leaves it 'manifest unknown')." >&2
+            echo "    Wait for the tag to be published, or set BST2_IMAGE to a known-good tag." >&2
+            exit 1
+        fi
+        rm -f "${HOME}/.cache/bst2-pull.err"
+    fi
     # shellcheck disable=SC2086
     {{sudo_cmd}} podman run --rm \
         --privileged \
