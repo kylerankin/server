@@ -43,9 +43,9 @@ bst *ARGS:
     # failed upstream build leaves it 'manifest unknown') instead of letting
     # podman fail deep inside a build. Skip the pull when the image is already
     # cached locally.
-    if ! {{sudo_cmd}} podman image exists "${{bst2_image}}" >/dev/null 2>&1; then
-        if ! {{sudo_cmd}} podman pull --quiet "${{bst2_image}}" 2>"${HOME}/.cache/bst2-pull.err"; then
-            echo "ERROR: could not pull bst2 image '${{bst2_image}}'." >&2
+    if ! {{sudo_cmd}} podman image exists "${bst2_image}" >/dev/null 2>&1; then
+        if ! {{sudo_cmd}} podman pull --quiet "${bst2_image}" 2>"${HOME}/.cache/bst2-pull.err"; then
+            echo "ERROR: could not pull bst2 image '${bst2_image}'." >&2
             sed 's/^/    /' "${HOME}/.cache/bst2-pull.err" >&2 || true
             echo "    The tag was likely never published by the FSDK build pipeline" >&2
             echo "    (a failed upstream build leaves it 'manifest unknown')." >&2
