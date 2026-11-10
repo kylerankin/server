@@ -1,0 +1,25 @@
+# Only the homelab Gateway's Envoy proxies (envoy-gateway-system) reach the
+# Console, so nothing in the cluster gets past 11-login-gate.yaml through
+# the Service. Enforced by Cilium (kubeadm) and kube-router (k0s); kubelet
+# probes from the node stay allowed. Applied before the Console starts.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kubestellar-console
+  namespace: kubestellar-console
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: envoy-gateway-system
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/component: proxy
+          gateway.envoyproxy.io/owning-gateway-name: homelab
+    ports:
+    - port: 8080
+      protocol: TCP

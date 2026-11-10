@@ -1,0 +1,33 @@
+[Unit]
+Description=Check Secure Boot before installing (USB installer)
+Documentation=file:/usr/libexec/bluefin-installer-secure-boot
+Documentation=https://github.com/projectbluefin/server/blob/main/docs/skills/usb-installer.md#secure-boot
+# Pulled in (Requires=) by the image's systemd-sysinstall drop-in and by
+# bluefin-homelab-install.service: if this fails, neither starts and no disk
+# is touched. Secure Boot on with the stick's keys passes silently; otherwise
+# it explains the firmware change on the monitor and asks, Cancel by default.
+# Unattended installs (a systemd.unit-dropin.systemd-sysinstall.service
+# credential) cancel unless bluefin.install-allow-insecure-boot allows it.
+# It reads the keys from the stick's ESP (loader/keys/auto/db.auth).
+RequiresMountsFor=/run/bluefin/installer
+After=systemd-vconsole-setup.service systemd-firstboot.service
+# sysinstall waits for logind anyway; ordered after it, logind's and D-Bus's
+# start-up messages do not land in the middle of the prompt.
+After=systemd-logind.service
+Wants=bluefin-installer-mute-console.service
+After=bluefin-installer-mute-console.service
+Before=systemd-sysinstall.service bluefin-homelab-install.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ImportCredential=bluefin.install-allow-insecure-boot
+ImportCredential=systemd.unit-dropin.systemd-sysinstall.service*
+ExecStart=/usr/libexec/bluefin-installer-secure-boot
+# On the monitor, like sysinstall and the Homelab prompt (the installer UKI
+# puts console=tty0 last, so /dev/console is tty1); the reason also goes to
+# the journal.
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/console

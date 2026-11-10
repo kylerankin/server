@@ -1,0 +1,139 @@
+name: Track junction refs
+
+# Resolves the BuildStream junction refs on a schedule and delivers the result
+# as its own titled pull request.
+#
+# This deliberately has NO `pull_request` trigger. The job this replaces
+# (`track-refs` in build.yml) ran on every `renovate/*` pull request and pushed
+# re-resolved junction refs onto that PR's branch, so unrelated dependency PRs
+# silently acquired freedesktop-sdk bumps that appeared in no title, body or
+# Renovate table. Moving the work onto a schedule with its own
+# branch also removes the need for the old `startsWith(github.head_ref,
+# 'renovate/')` gate: a branch name is not an identity, and on a scheduled
+# trigger there is no PR-controlled head to gate in the first place.
+on:
+  schedule:
+    # Offset from dakota's trackers (06:00 and 20:00 UTC) to spread runner load.
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Tracking only queries upstream git remotes to resolve refs; it never builds
+# and never touches the CAS, so it has no reason to share the build group.
+concurrency:
+  group: track-junctions
+  cancel-in-progress: false
+
+jobs:
+  track-junctions:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    # The mergeraptor app key lives in this environment, which only main may
+    # use. GITHUB_TOKEN stays read-only: every write uses the app token.
+    environment: trackers
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up just
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+        with:
+          tool: just@1.59.0
+
+      - name: Track and resolve the BuildStream junction ref
+        run: |
+          set -euo pipefail
+          # No `|| true` here. The job this replaces swallowed the exit code,
+          # which made an upstream outage indistinguishable from "nothing to
+          # track" and let the run report success having resolved nothing.
+          just bst source track freedesktop-sdk.bst
+
+      - name: Sync installer-version to the tracked FSDK point release
+        # project.conf's installer-version must equal the FSDK point release:
+        # check-release-version.py fails closed on drift and is the first
+        # thing `just validate` runs, so without this sync an FSDK bump would
+        # open a PR that dies in seconds at "Validate Element Graph". --fix
+        # rewrites installer-version, then runs the same check.
+        run: python3 .github/scripts/check-release-version.py --fix
+
+      # A GitHub App token, not secrets.GITHUB_TOKEN: pushes and PRs made with
+      # GITHUB_TOKEN do not dispatch workflow runs, which is why the old job's
+      # github-actions[bot] commits left PRs sitting at `action_required` with
+      # zero jobs and no checks at all. Minted only now, after the privileged
+      # `just bst` container has run, narrowed to the push and the PR, and
+      # never written to .git/config.
+      - name: Get mergeraptor token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          app-id: ${{ secrets.MERGERAPTOR_APP_ID }}
+          private-key: ${{ secrets.MERGERAPTOR_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Create or update the junction bump PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          old_fsdk=$(git show "HEAD:elements/freedesktop-sdk.bst" | awk '/^[[:space:]]*ref:/ { print $2; exit }')
+          new_fsdk=$(awk '/^[[:space:]]*ref:/ { print $2; exit }' elements/freedesktop-sdk.bst)
+          point() { sed 's/^freedesktop-sdk-//;s/-[0-9]*-g[0-9a-f]*$//' <<< "$1"; }
+
+          title="chore(deps): update BuildStream junctions"
+          if [ "$old_fsdk" != "$new_fsdk" ]; then
+            title="${title} (freedesktop-sdk $(point "$old_fsdk") -> $(point "$new_fsdk"))"
+          fi
+
+          {
+            echo "Scheduled resolution of the BuildStream junction ref to its"
+            echo "\`git-describe\` form. Opened by the tracker so the bump arrives as its own"
+            echo "reviewable change instead of being pushed into an unrelated pull request."
+            echo ""
+            echo "| Junction | From | To |"
+            echo "| --- | --- | --- |"
+            echo "| \`elements/freedesktop-sdk.bst\` | \`${old_fsdk}\` | \`${new_fsdk}\` |"
+            echo ""
+            echo "\`project.conf\`'s \`installer-version\` is synced to the pinned FSDK point"
+            echo "release in the same commit, because \`check-release-version.py\` fails closed"
+            echo "on drift between the two."
+            echo ""
+            echo "---"
+            echo "*Generated by [Track junction refs](${RUN_URL})*"
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          bash .github/scripts/propose-pr.sh --branch auto/track-junctions \
+            --title "$title" --body-file "$RUNNER_TEMP/pr-body.md" \
+            -- elements/freedesktop-sdk.bst project.conf
+
+  # Scheduled runs block nothing, so a failure is invisible unless this says
+  # so: same shared script and semantics as build.yml's nightly-status.
+  status:
+    needs: [track-junctions]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - name: Checkout the tracking-issue script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/tracking-issue.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Open, update or close the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FAILED: ${{ contains(needs.*.result, 'failure') }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash .github/scripts/tracking-issue.sh "Junction tracker failing" "The Track junction refs workflow" "a later run"

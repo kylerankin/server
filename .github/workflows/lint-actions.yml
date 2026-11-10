@@ -1,0 +1,50 @@
+name: Lint workflows
+
+# actionlint (workflow syntax, expressions, shellcheck on `run:` scripts) and
+# zizmor (security audits) over .github/workflows. Both run from container
+# images pinned by digest; Renovate's github-actions manager bumps the
+# docker:// references. No `paths:` filter, so both can be required checks.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The merge queue's checks run on the merge group's commit.
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Reads .github/actionlint.yaml (runner labels newer than its list).
+      - name: actionlint
+        uses: docker://docker.io/rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        with:
+          args: -color
+
+  zizmor:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The read-only token enables the online audits (impostor commits,
+      # known-vulnerable actions, ref/version mismatches).
+      - name: zizmor
+        uses: docker://ghcr.io/zizmorcore/zizmor:1.32.0@sha256:3014cc8f68f663935f69b3c3e0e41f5ce102b268d97db13db0f62208747f860d
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          args: --format=github .

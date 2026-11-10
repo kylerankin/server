@@ -1,47 +1,121 @@
 name: Unit tests
 
+# No `paths:` filter: a path-filtered workflow never reports on pull requests
+# it skips, so it cannot be a required check. Both jobs take minutes.
 on:
   pull_request:
-    paths:
-      - '.github/scripts/**'
-      - '.github/workflows/unit-tests.yml'
-      - 'files/**'
-      - 'tests/unit/**'
-      - 'Justfile'
   push:
     branches: [main]
-    paths:
-      - '.github/scripts/**'
-      - '.github/workflows/unit-tests.yml'
-      - 'files/**'
-      - 'tests/unit/**'
-      - 'Justfile'
+  # The merge queue's checks run on the merge group's commit.
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
 
 jobs:
   unit:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          python-version: '3.14'
+          python-version: '3.15'
 
       - name: Install dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y bats
-          pip install pytest pyyaml
+          sudo apt-get update && sudo apt-get install -y bats nodejs shellcheck
+          pip install -r .github/requirements-ci.txt
+
+      # Ubuntu's AppArmor policy blocks unprivileged user namespaces; the
+      # os-justfile bats tests run the k8s recipe inside one.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
 
       - name: Set up just
-        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
         with:
-          tool: just
+          tool: just@1.59.0
+
+      # The helper tests build bluefin-host (tests/unit/conftest.py host_bin).
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: files/homelab/cluster/go.mod
+          cache: false
+
+      - name: Lint Python
+        run: just lint-python
 
       - name: Run unit tests
         run: just test-unit
+
+      # The floor is .coveragerc's fail_under, which `just test-unit` already
+      # enforces; this step only renders the same report for the summary.
+      - name: Python coverage summary
+        run: python -m coverage report --format=markdown >> "${GITHUB_STEP_SUMMARY}"
+
+      # The `root` tests (pytest.ini) change ownership and drop privileges for
+      # real, so the unprivileged run above skips them; here an unprivileged
+      # run fails (tests/unit/conftest.py). Last, and with no coverage, cache
+      # or bytecode, so it leaves nothing root-owned in the checkout.
+      - name: Run root unit tests
+        run: sudo --preserve-env=CI env "PATH=${PATH}" PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -m root -p no:cacheprovider
+
+  # The Go modules the image builds. Their element runs `go vet` and
+  # `go test` inside the image build, so a failing or flaky test would
+  # otherwise surface only on main, as a failed release. -race is extra here:
+  # the race detector needs cgo, which the element disables.
+  # tests/unit/test_ci_workflows.py fails when a go.mod is missing here.
+  go:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - files/homelab/cluster
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    # As in the image build: offline, vendored dependencies.
+    env:
+      GOFLAGS: -mod=vendor
+      GOPROXY: "off"
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Dependencies are vendored, so there is no module cache to restore.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache: false
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(go list -f '{{.Dir}}' ./... | xargs gofmt -l)"
+          if [ -n "${unformatted}" ]; then
+            printf '::error::gofmt -l reports unformatted files:\n%s\n' "${unformatted}"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race ./...

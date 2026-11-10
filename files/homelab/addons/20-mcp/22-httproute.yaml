@@ -1,0 +1,29 @@
+# The MCP endpoint (Streamable HTTP, https://mcp.<HOMELAB_DOMAIN>/mcp) on the
+# homelab Gateway. Requests without a bearer token get 401.  Pinned to
+# the `https` listener section so the bearer token never traverses the
+# plaintext `:80` listener.
+# Strict-Transport-Security (max-age one year, no includeSubDomains, so other
+# devices under <HOMELAB_DOMAIN> are never pinned to HTTPS) makes a browser
+# that has reached this host once go straight to https next time (#389).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mcp
+  namespace: mcp
+spec:
+  parentRefs:
+  - name: homelab
+    namespace: envoy-gateway-system
+    sectionName: https
+  hostnames:
+  - "mcp.${HOMELAB_DOMAIN}"
+  rules:
+  - backendRefs:
+    - name: mcp-kubernetes-mcp-server
+      port: 8080
+    filters:
+    - type: ResponseHeaderModifier
+      responseHeaderModifier:
+        set:
+        - name: Strict-Transport-Security
+          value: "max-age=31536000"

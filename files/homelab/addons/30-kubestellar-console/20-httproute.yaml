@@ -1,0 +1,33 @@
+# The KubeStellar Console on the homelab Gateway at https://kubestellar.<HOMELAB_DOMAIN>;
+# its sign-in endpoints take the route in 11-login-gate.yaml.  Pinned to
+# the `https` listener section so the password-protected `/auth/github`
+# request never traverses the plaintext `:80` listener (it would otherwise
+# be reachable over plain HTTP; the HTTP→HTTPS redirect in
+# 40-envoy-gateway/21-http-redirect.yaml does not help on its own, because
+# basic-auth and the `kc_auth` cookie are sent in cleartext before the
+# redirect fires).
+# Strict-Transport-Security (max-age one year, no includeSubDomains, so other
+# devices under <HOMELAB_DOMAIN> are never pinned to HTTPS) makes a browser
+# that has reached this host once go straight to https next time (#389).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: kubestellar-console
+  namespace: kubestellar-console
+spec:
+  parentRefs:
+  - name: homelab
+    namespace: envoy-gateway-system
+    sectionName: https
+  hostnames:
+  - "kubestellar.${HOMELAB_DOMAIN}"
+  rules:
+  - backendRefs:
+    - name: kubestellar-console
+      port: 8080
+    filters:
+    - type: ResponseHeaderModifier
+      responseHeaderModifier:
+        set:
+        - name: Strict-Transport-Security
+          value: "max-age=31536000"

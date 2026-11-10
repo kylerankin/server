@@ -1,52 +1,313 @@
 ---
 name: ddi-installer-build
-description: Build, export, flash, and release the Bluefin Server installer media and DDI payload.
+description: Build, export, and dogfood the Bluefin Server image set (OS DDI, signed UKIs, netboot ESP) and the opt-in sysexts.
 metadata:
   type: how-to
   status: stable
-  last_updated: "2026-09-08"
+  last_updated: "2026-10-17"
   context7-sources:
     - /systemd/systemd
     - /apache/buildstream
+    - /websites/man7_linux_man-pages
+    - /nixos/patchelf
 ---
-# DDI Installer Build and Release
+# Image Build and Dogfood
 
-Use this skill when you need to build the installer or DDI artifacts, export them,
-flash them to media, or understand the release automation.
+Use this skill when you need to build the release image set, export it, boot it
+in QEMU, or run the end-to-end install/update/rollback test.
 
 ## Build targets
 
-The repo exposes the main build entrypoints through `just`:
+The repo exposes the main build entrypoints through `just`. BuildStream runs
+inside the FSDK `bst2` container (`just bst`); it is not installed locally.
 
 ```bash
-just validate              # resolve the BuildStream graph
-just cluster-build         # submit an Argo workflow to build/publish
-just build-installer       # build the installer locally
-just export-installer      # export installer + UKI + SHA256SUMS to dist/
-just export-pxe            # export standalone PXE vmlinuz/initrd to dist/
-just build-ddi             # build the OS DDI payload
-just export-ddi            # export DDI + SHA256SUMS to dist/ddi/
-just build-sysext          # build the k0s sysext
-just export-sysext         # export sysext artifacts to dist/sysext/
-just flash-installer       # write the installer image to a USB device
-just show-me-the-future    # end-to-end QEMU installer smoke test
-just tags                  # show FSDK-derived version tags
+just validate          # version invariants + resolve the shipped element graphs
+just test-unit         # pytest + bats
+just gen-dev-keys      # throwaway Secure Boot keys + the public dev module key in files/boot-keys/
+just set-version V     # set image-version in include/image.yml (<=17 chars,
+                       # increasing under strverscmp)
+just build-image       # build oci/bluefin-server-image.bst
+just export-image      # export the release set to dist/diskless/
+just build-sysext      # build oci/k0s-sysext.bst
+just export-sysext     # export k0s sysext + SHA256SUMS to dist/sysext/
+just build-zfs-sysext  # build oci/zfs-sysext.bst
+just export-zfs-sysext # export OpenZFS sysext + SHA256SUMS to dist/sysext/
+just build-nvidia-sysext  # build oci/<flavour>-sysext.bst (nvidia-open-595)
+just export-nvidia-sysext # export NVIDIA sysext + SHA256SUMS to dist/sysext/
+just dogfood-nvidia       # QEMU disk install + merge/probe dist/diskless/'s NVIDIA sysext
+just version / just tags  # FSDK-derived point release and tag set
+just check-image [DIR] [BASELINE]  # broken-reference check of an exported set
 ```
 
-## Preferred build path
+`just export-image` writes one directory per image version containing the OS
+DDI, the sysupdate usr/usr-verity sources, both UKIs, the netboot ESP image,
+the k0s/KubeStellar/OpenZFS sysext assets, the `efi-keys/` enrollment
+payloads, and a `SHA256SUMS` over all of it with its detached signature
+`SHA256SUMS.gpg` (signed in-element by `oci/bluefin-server-image.bst`). See
+[ddi-installer.md](ddi-installer.md) for what each artifact is.
 
-For heavy builds, prefer the cluster build over a local workstation build:
+Home Server builds `homebrew/image.bst` through `fsdk-containers.bst`; the
+producer exports its independently pinned Brew machine, not host binaries.
+Keep the host and producer FSDK junctions explicitly duplicated in `project.conf`:
+their filesystems are packaged separately. Share the identical community-plugin
+junction through the consumer override; recheck its pins before changing that
+mapping. Text-only manual elements use `strip-binaries: ""`, matching
+`os-creds-prov.bst`, rather than adding a binary-stripping toolchain.
+The separate `oci/homebrew-integration-sysext.bst` supplies the optional host
+bridge and Python closure, not base `/usr`. Its version-locked asset and the
+machine asset are signed together; the `homebrew` feature stages both.
+Use a merged `fsdk-containers` main SHA before shipping this consumer.
+
+
+To publish the set as an OCI artifact (one layer per file, tags `<version>`
+and `latest`, artifact type
+`application/vnd.projectbluefin.server.release.v1`):
 
 ```bash
-just cluster-build
+just publish-oci ghcr.io/<owner>/bluefin-server                 # podman login first
+just publish-oci <registry-host>:30500/bluefin-server dist/diskless 1  # plain HTTP
 ```
 
-This submits the `bluefin-server-build-pipeline` Argo workflow and uses the
-cluster cache rather than starving your local machine.
+## bluefin-host
+
+The base OS's non-interactive runtime helpers (update status, reboot
+interlocks and FleetLock client, boot deadline, diskless update check, sysext
+fetch, first-boot naming and credentials, the module-sysext loader, the
+`/etc` mode repair) are one static Go binary,
+`files/homelab/cluster/cmd/bluefin-host` with its packages in
+`internal/host/` (standard library only, in the vendored bluefin-cluster
+module). `bluefin-server/os-host.bst` builds it into `/usr/bin/bluefin-host`
+and links each `/usr/libexec/bluefin-<name>` to it; the binary runs the helper
+its name (or its first argument) names. Unit drop-ins call
+`bluefin-host kube-interlock`, `kured-flag`, `mask-uki-transfer` and
+`boot-is-good` directly. Installer helpers, the justfile and the initrd's
+copy of `bluefin-boot-origin` stay shell.
+
+```bash
+cd files/homelab/cluster
+gofmt -l cmd internal && go vet ./... && go test -race ./...  # as CI's go job
+just bst build bluefin-server/os-host.bst                    # vet + test in-element
+python3 -m pytest tests/unit -q                              # builds and runs it
+```
+
+The pytest suites build the binary once per session (`host_bin` in
+`tests/unit/conftest.py`, needs `go`) and run it under the helpers' old
+names against stub systemd tools on `PATH`, with the same `BLUEFIN_*`
+overrides the shell helpers read.
+
+## Keys
+
+Every image build signs: the UKIs and systemd-boot with DB, kernel modules
+with the module signing certificate, and the release `SHA256SUMS` with the
+image signing key. What each key is, where it lives, what `just gen-dev-keys`
+generates (throwaway keys in the gitignored `files/boot-keys/`, kept unless
+`--force`, a partial set is an error, the module pair is the public
+INSECURE dev pair so the kernel comes from the cache), and how CI supplies
+the real keys:
+[secure-boot-keys.md](secure-boot-keys.md). The release-signing half
+(`sysupdate-signing.asc` / `import-pubring.pgp`, the committed
+`files/os/sysupdate-keys/import-pubring.gpg`, and rotation):
+[systemd-sysupdate-verification.md](systemd-sysupdate-verification.md).
+
+**Rotating any key needs a new `image-version`.** Every key ends up in the
+image bits: DB signs the UKIs and systemd-boot, the module certificate is
+built into the kernel, and `import-pubring.pgp` ships in `/usr`. An image
+version names one immutable set of bits, and `systemd-sysupdate` only
+installs a version newer than the one it runs, so rebuilding the same version
+with new keys publishes different bits under a released name and never
+reaches nodes already on it. Rotate keys, then `just set-version` to a
+version that sorts higher before building.
+
+## Reproducible builds
+
+With the same checkout, keys and `image-version`, rebuilding the final
+assembly gives the same bytes. BuildStream exports `SOURCE_DATE_EPOCH` into
+every sandbox and the assembly steps honor it: `mkfs.erofs` and
+`systemd-repart` clamp file times to it, the initrd and ESP trees are clamped
+before `cpio` and `mcopy` copy them, and `systemd-sbsign` (not `sbsign`)
+uses it as the signing time of systemd-boot and the UKIs. `systemd-repart
+--seed` fixes partition UUIDs.
+
+Two outputs carry a signing time of their own: `SHA256SUMS.gpg` and the
+`efi-keys/*.auth` updates, which `sbvarsign` stamps with the current time
+(they stay fixed as long as `bluefin-server/keys/efi-keys.bst` stays
+cached). `.github/workflows/reproducibility.yml` checks the rest weekly:
+it builds, deletes the final-assembly artifacts, rebuilds them without remote
+caches, and compares every file except `*.gpg`. The final assembly
+(`FINAL_ASSEMBLY`) is everything `oci/bluefin-server-image.bst` stages into
+the release set plus every `oci/*` target `just validate` resolves;
+`tests/unit/test_reproducibility_workflow.py` fails when a shipped element is missing.
+
+## Dogfood: boot it in QEMU
+
+All dogfood paths boot with Secure Boot firmware (OVMF secboot). The firmware
+starts in setup mode; systemd-boot enrolls the dev keys from the ESP
+(`secure-boot-enroll if-safe`) and reboots, so every later boot is verified.
+`--check` fails if the guest did not boot with Secure Boot enabled: some OVMF
+builds (Ubuntu 26.04's 2025.11) refuse the enrollment and would otherwise boot
+on in setup mode, verifying nothing. Point `OVMF_CODE` / `OVMF_VARS` at
+another build (Fedora's `edk2-ovmf` works) if yours does.
+
+```bash
+just dogfood                     # interactive diskless boot of dist/diskless/
+just dogfood-check               # headless: pass when the in-guest probe
+                                 # reports no failed units
+just dogfood-install             # diskless boot, systemd-sysinstall to a blank
+                                 # disk, then boot the installed disk
+just dogfood-install NEXT=<dir>  # ...then sysupdate A->B to NEXT and boot it
+just dogfood-installer           # offline USB installer: unattended install to a blank disk, boot it with and without the stick
+just dogfood-installer NEXT=<dir> # ...then failed checks on the banner, sysupdate to NEXT and boot it
+DOGFOOD_TARGET=prior-install just dogfood-installer  # ...then install again over that install and boot it
+DOGFOOD_TARGET=foreign-gpt just dogfood-installer    # install over another OS's GPT disk (also: ext4, xfs on the whole disk)
+DOGFOOD_INSTALL=console just dogfood-installer      # typed at the monitor: disk by number, "installed" screen, root password and tty1 login
+DOGFOOD_INSTALL=console DOGFOOD_CONSOLE_NOISE=1 just dogfood-installer  # ...while the guest logs kernel and journal errors: none may reach the disk, summary or done screen
+DOGFOOD_INSTALL=console DOGFOOD_CONSOLE_FAILURE=kernel just dogfood-installer  # ...but sysinstall fails on a missing disk UKI before any disk write: error on the monitor, machine up, journal kept
+DOGFOOD_INSTALL=console DOGFOOD_CONSOLE_HOLD=8 just dogfood-installer  # ...holding each prompt on the monitor 8 s (2-8, default 3)
+DOGFOOD_PROFILE=home-server DOGFOOD_INSTALL=console just dogfood-installer # Home options, nonroot owner creation/login, SSH Brew and host-engine workloads
+```
+
+`scripts/dogfood-installer.sh` recreates `DOGFOOD_STATE` (default
+`dist/dogfood-installer`) on every run; use a disposable path. Any
+`systemd.unit-dropin.systemd-sysinstall.service` credential makes an install
+unattended and skips the disk question; never use one to instrument an
+attended run.
+
+`scripts/dogfood-diskless.sh <dir> [--check]` boots the way a PXE/HTTP-booted
+node would: signed systemd-boot -> signed netboot UKI -> initrd pulls
+`bluefin-server_<ver>.raw` over HTTP into RAM -> dm-verity /usr, tmpfs root.
+Useful environment variables:
+
+- `DOGFOOD_IGNITION=<file>` — pass an Ignition config as the `ignition.config`
+  credential (see `tests/fixtures/ignition/var-on-disk.ign`).
+- `DOGFOOD_CREDS=<dir>` — pass every file in `<dir>` as a system credential
+  named after the file (SMBIOS type 11).
+- `DOGFOOD_STATE_DISK=<file>` — attach a persistent second disk (`/dev/vdb`).
+- `DOGFOOD_VARS=<file>` — persistent UEFI variable store (keeps enrolled keys
+  across runs).
+- `DOGFOOD_BOOT=disk` — boot `DOGFOOD_STATE_DISK` instead of the netboot ESP.
+- `DOGFOOD_BOOT=http` — UEFI HTTP boot the netboot UKI; the initrd derives the
+  `/usr` image URL from the boot URL. Enrolls the Secure Boot keys from the
+  netboot ESP once per variable store first.
+- `DOGFOOD_BOOT_URL=<url>` — HTTP boot from another server (e.g. Booty)
+  instead of the built-in one.
+- `DOGFOOD_NODE_IGN=<file>` — serve it as `bluefin-node.ign` next to the
+  UKI, unsigned unless `DOGFOOD_NODE_IGN_SIG=<file>` names its
+  `bluefin-node.ign.gpg` (`scripts/sign-node-config.sh
+  files/boot-keys/ignition-signing.asc <file>`). An unsigned config is applied
+  only through the netboot UKI's transitional `bluefin.ignition.allow-unsigned`
+  default (see "Per-node configuration" in
+  [booty-integration.md](booty-integration.md)).
+- `DOGFOOD_REFUSAL=<ERE>` — `--check` passes only if the boot is refused
+  before the probe runs, with a console line matching `<ERE>` (e.g. a node
+  config the initrd will not apply).
+- `DOGFOOD_SERVE_EXTRA=<dir>` — also serve the files in `<dir>`.
+- `DOGFOOD_TAMPER=raw|sums` — serve a corrupted DDI (`raw`), or the corrupted
+  DDI with `SHA256SUMS` re-hashed to match it, so only `SHA256SUMS.gpg` no
+  longer fits (`sums`). `--check` then passes only if the initrd's pull
+  refuses it for that reason (checksum mismatch, bad signature) after the
+  image and both manifest files were served, and nothing booted. Credential
+  drop-ins copy `systemd-importd`'s messages to the serial console.
+- `DOGFOOD_MEM=<MiB>` — guest RAM (default 4096); below the diskless minimum
+  the boot must fail with the RAM message (see `diskless-troubleshooting.md`).
+- `DOGFOOD_EXTRA_PROBE=<file>` — shell snippet appended to the in-guest probe.
+- `DOGFOOD_PROBE_LOG=<file>` — write the probe's output there while it runs,
+  for a caller that reacts to it (`dogfood-homelab-templates.sh` reads the
+  control plane's join passphrase from it).
+- `DOGFOOD_EXPECT=<ERE>` — `--check` also requires the probe output to match,
+  e.g. with `tests/fixtures/ignition/apply-marker.ign` and its `.probe`:
+  `PROBE ignition marker=applied unit=active enabled=enabled ran=yes`.
+- `DOGFOOD_PORT`, `DOGFOOD_MEM`, `DOGFOOD_TIMEOUT` — HTTP port (8765), guest
+  memory in MiB (4096), `--check` deadline in seconds (600).
+
+Every diskless `--check` boot also runs `bluefin-diskless-update-check` once
+and reports `PROBE update-check=<result> flag=<set|none>`. Its origin is the
+versioned `import.pull` file, so a newer release in the served directory only
+logs that the node is pinned; an HTTP boot through a fixed-name UKI
+(`DOGFOOD_BOOT=http`, `DOGFOOD_BOOT_URL=.../bluefin-server-netboot.efi`)
+sets the flag.
+
+`scripts/dogfood-install.sh <dir> [<next-dir> [<broken-dir>]]` is the full
+end-to-end check: install from a diskless boot, boot the installed disk,
+`systemd-sysupdate` A->B to `<next-dir>` through `systemd-sysupdate.service`
+(the unit the timer starts) with the default `Verify=yes` against the signed
+manifest (with the `zfs` feature enabled, so the ZFS sysext follows the OS in
+lock-step), then asserts the kured flag, the Kubernetes reboot interlock, both
+timers enabled and the new UKI blessed after `boot-complete.target`, and with
+`<broken-dir>` break the update and confirm boot counting rolls the node back
+to `<next-dir>` on its own, with the matching ZFS sysext still merged.
+`DOGFOOD_SYSEXT=nvidia` enables the `nvidia-open-595` feature instead of `zfs`
+and the NVIDIA Container Toolkit component with
+`nvidia-container-toolkit-activate.service`; after the update and after the
+rollback the driver sysext for the booted version must be merged with its
+units skipped (no GPU in QEMU), `bluefin-sysext-modules nvidia` must load the
+signed modules as far as the driver's `No NVIDIA GPU found`, and the toolkit
+must be fetched and merged. `DOGFOOD_SYSEXT=zfs,nvidia` enables both features
+and asserts both sets, with the `zfs` module loaded.
+`just dogfood-install <next-dir> <broken-dir>` runs the whole sequence.
+`DOGFOOD_BROKEN=slot` (default) corrupts the updated usr slot, so the initrd
+fails. `DOGFOOD_BROKEN=unit` adds a unit that fails on `<broken-dir>`'s version
+only and shortens the boot deadline (`DOGFOOD_DEADLINE`, default `2min`): each
+counted boot reaches `multi-user.target`, misses `boot-complete.target`, and
+`bluefin-boot-deadline` reboots it. The run asserts three such boots, the
+fallback boot with the deadline timer inactive, and then no kured flag and a
+skipped `systemd-sysupdate-reboot.service` for the failed version. `<next-dir>` and `<broken-dir>` are
+ordinary image sets with higher versions, e.g.
+`just set-version <next> && just export-image dist/diskless-next` (and a
+higher one into `dist/diskless-broken`); the script breaks the
+broken set itself. The versions must also sort above `1.<ver>` for systemd-boot: the
+Type #1 entry `systemd-sysinstall` writes for the installed image carries
+`version 1.<ver>` (`bluefin-server-commit_1.<ver>.conf`), so after
+installing `0.674` an update to `0.674.1` still boots `0.674`; use `1.674.1`.
+Release versions (`YY.MM.<run>`) sort above it. Which of these scenarios CI runs is listed in
+[ci-tooling.md](ci-tooling.md) (the `boot-test` job); `scripts/ci/boot-test.sh --list`
+prints the exact calls.
+
+## Pruning and the image check
+
+`/usr` and the initrd are composed from whole FSDK components, so they carry
+files nothing on a server node uses. Two mechanisms remove them:
+
+- `bluefin-server/os-filesystem.bst` excludes the `locale` split domain
+  (message catalogs and locale sources). Only `C.UTF-8` and `en_US.UTF-8` are
+  compiled into `/usr/lib/locale`, so other catalogs could never load.
+- `files/prune/` holds reviewed glob lists, applied by `files/prune/prune.sh`:
+  `common.list` to both trees, then `usr.list` in `oci/bluefin-server-usr.bst`
+  or `initrd.list` in `oci/bluefin-server-boot.bst`. Each entry states why
+  nothing uses it. A pattern that matches nothing fails the build, so the
+  lists cannot go stale after an FSDK bump. The initrd also keeps only the
+  terminfo entries named in `initrd-terminfo` in `bluefin-server-boot.bst`.
+
+`just check-image [DIR] [BASELINE]` (`.github/scripts/check-image.py`)
+extracts the `/usr` image, the disk UKI's initrd, and every sysext, and fails
+when any ELF `DT_NEEDED` library, any `required` `.note.dlopen` library, or
+any program named by a unit `Exec*=` line or a udev
+`RUN`/`PROGRAM`/`IMPORT{program}` is missing. Sysexts resolve over `/usr`.
+`-`-prefixed commands and programs guarded by a `ConditionPathExists=` are
+skipped. With `BASELINE` (an older `*.usr.raw`) it also lists the `/usr`
+paths added and removed. Pre-existing FSDK gaps are waived in `KNOWN_BROKEN`
+in the script; that set is shrink-only (an entry that no longer matches fails
+the check). CI runs it as the `image-check` job against the latest release.
+
+Only prune what the check can prove unused, or what nothing outside an
+interactive shell runs. Kernel modules, hwdb, keymaps and tools users run
+directly are product decisions, not prune-list entries. Decided so far: the
+drivers whose hardware needs firmware the image never ships (Wi-Fi,
+Bluetooth, AMD/Radeon/Nouveau/Xe GPUs) are off in the kernel config
+(`patches/freedesktop-sdk/0009`); i915, simpledrm and the virtual GPUs stay;
+sound, media and IIO are untouched pending a product call. The check cannot see
+programs a binary execs itself: `systemd-pull` (behind `systemd-sysupdate`)
+runs `gpg`, which starts `gpg-agent` and `keyboxd`, so those stay with `gpgv`.
+
+Disabling systemd features (homed, userdb, portabled, oomd, localed,
+timedated, backlight, rfkill, hibernate, xdg-autostart) would need a patch on
+FSDK's systemd element, which moves systemd and every dependent off FSDK's
+artifact cache for every build; not done until measured to be worth it.
 
 ## Local builds with a remote cache
 
-If you must build locally, point BuildStream at your cluster cache tunnel host (`<build-cache-host>`) by creating `~/.config/buildstream.conf` on your workstation. Operators must substitute `<build-cache-host>` with their specific cluster cache hostname or IP when setting up the SSH tunnel (e.g. `ssh -L 8980:<build-cache-host>:8980 ...`):
+If you must build locally with the cluster cache, point BuildStream at your
+cache tunnel host (`<build-cache-host>`) in `~/.config/buildstream.conf`:
 
 ```yaml
 projects:
@@ -58,82 +319,51 @@ projects:
         push: true
 ```
 
-Then run `just build-installer` or `just build-ddi`.
-
-## Flashing the installer media
-
-The installer is distributed as a UEFI-bootable raw GPT disk image (`.raw`)
-that can be written directly to a USB drive.
-
-### Recommended: `just flash-installer`
-
-```bash
-just flash-installer /dev/sdX
-```
-
-The wrapper validates the image, lists devices if you omit one, asks for
-confirmation, and writes the image with direct I/O and an explicit sync.
-
-### Manual `dd` flashing
-
-```bash
-sudo sh -c 'zstd -dc dist/bluefin-server-installer-*.raw.zst \
-  | dd of=/dev/sdX bs=4M iflag=fullblock oflag=direct status=progress conv=fsync'
-```
-
-Use direct I/O and full-block reads to avoid dirtying the page cache.
-
 ## Release automation
 
-The release process is driven by `.github/workflows/build.yml`:
-
-- Renovate point-release updates or direct pushes to `main` trigger a full build.
-- CI builds the DDI payload, installer, target UKI, k0s sysext, and standalone
-  PXE boot inputs (`bluefin-server-pxe-vmlinuz-*`, `bluefin-server-pxe-initrd-*.cpio.gz`).
-- CI uploads the versioned release assets to the corresponding
-  `installer-v<release-version>` GitHub Release.
-- CI also produces a combined `dist/release/SHA256SUMS` manifest and signs it
-  to create `SHA256SUMS.gpg` for `systemd-sysupdate` verification. The PXE
-  inputs are included in this manifest, per `docs/skills/ddi-installer.md`.
+`.github/workflows/build.yml` runs `just validate`, exports the image set
+(already carrying its signed `SHA256SUMS(.gpg)`), runs the QEMU boot test, and
+on `main` publishes `dist/diskless/` as-is (see the `release` job in
+[ci-tooling.md](ci-tooling.md)). One version is published
+exactly once; creating an existing tag fails rather than overwriting assets
+nodes may already trust.
 
 ## Common rationalizations
 
 | Rationalization | Reality |
 |---|---|
-| "A bash script is simpler." | A bash script cannot run the systemd-native interactive installer TUI. Use `systemd-sysinstall`. |
-| "Kernel image is at `/boot/vmlinuz`." | FSDK installs kernels into `/usr/lib/modules/<kver>/vmlinuz`. Toolchains (dracut, ukify, PXE export) must point to `/usr/lib/modules/<kver>/vmlinuz`. |
-| "Initrd archive tools (gzip, cpio) are in base-stack." | In FSDK 26.08, gzip and cpio are standalone components; elements packing or unpacking initrds must explicitly declare `components/gzip.bst` and `components/cpio.bst` in `build-depends`. |
-| "Use knuckle instead." | knuckle is deprecated in favor of native `systemd-sysinstall` (systemd 261+). |
-| "Hardcode `root=/dev/vda2` for QEMU." | Bare metal has different device names. Always use PARTUUID. |
-| "Pull the DDI from the network at install time." | Network failures = broken installs. The DDI is embedded in the installer media. |
-| "Put the DDI in the initrd cpio." | The DDI is 2 GiB+. The initrd cpio step must run before the DDI is placed in `/layer`. |
-| "Store the DDI in the ESP (FAT32)." | FAT32 has a 4 GiB per-file limit. Use a separate XFS partition. |
-| "Add an 8 GiB minimum size floor to the DDI." | The rootfs is immutable. It never grows in-place. Content + overhead is enough. |
+| "Skip `gen-dev-keys`, the build has defaults." | Signing needs real key material in `files/boot-keys/`; the recipe generates throwaway keys so local builds boot under Secure Boot. |
+| "Test the UKI with `-kernel`/`-initrd`." | That bypasses the signed boot chain. The dogfood scripts boot the netboot ESP or installed disk through OVMF the way firmware does. |
+| "Reboot loops mean the boot hung." | With Secure Boot in setup mode the first boot enrolls keys and reboots; that is expected once per fresh variable store. |
+| "A failed update needs manual recovery." | Boot counting handles it: three failed boots of the new UKI and systemd-boot falls back to the previous image; `bluefin-boot-deadline` reboots a boot that comes up with a failed unit. `dogfood-install.sh <dir> <next> <broken>` proves it (`DOGFOOD_BROKEN=unit` for the failed-unit case). |
+| "`chmod 4755` in install-commands makes a file setuid in the image." | No. BuildStream artifacts keep one executable bit per file, so every staged file is 0644/0755. FSDK components declare their special modes as initial scripts, and `oci/bluefin-server-usr.bst` runs them (`os-initial-scripts.bst`) while assembling /sysroot; special modes must be set in the `script` element that writes the image. |
+| "Rootless engines need setuid added to `newuidmap`/`newgidmap`." | Keep FSDK's native 0755 + `cap_setuid=ep`/`cap_setgid=ep` from its initial scripts. Adding setuid changes the effective UID while file capabilities still limit privileges; the helper then cannot open the caller's `/proc/<pid>/{uid,gid}_map`. The real rootless workload tests, not a setuid-bit assertion, are the contract. |
+| "Private crun inherits the wrapper's loader environment." | Conmon sanitizes it. Set crun's RUNPATH to `$ORIGIN/../lib` and each private `libcrun.so*` to `$ORIGIN` in `runtimes/podman-runtime.bst`; retain the same pinned FSDK libraries privately. Verify `env -i /usr/lib/bluefin/podman/bin/crun --version` and a real rootless workload. |
+| "The seeded prefix can become owner-writable while root walks it." | Keep the copy behind a root-owned 0700 staging envelope until all privileged traversal finishes, then publish atomically. The real unprivileged-process regression must not transfer ownership of a host directory selected by a racing symlink. |
+| "A passing probe means the VM can be power-cut." | Sync after appended Home workloads, before the completion marker, then request native ACPI shutdown and await exit. Otherwise newly pulled OCI layer files can persist as empty files on the next boot. |
+| "Stop nspawn with the guest init signal." | The service's main process is the supervisor, not guest PID 1. Keep default SIGTERM with `KillMode=mixed`; nspawn sends the guest's orderly signal and cleans its exports. Sending SIGRTMIN+3 to the supervisor leaves mounts that block restart. |
 
 ## Red flags
 
-- `systemd-sysinstall.service` is missing from `system-install.target.wants`.
-- Boot cmdline uses a hardcoded device path like `root=/dev/vda2`.
-- DDI decompression is placed before the cpio step.
-- The installer data partition uses FAT32/vfat instead of XFS.
-- The repart recipe is missing `GrowFileSystem=yes` for the copied rootfs.
-- Unattended target-disk discovery is not filtered and can select empty devices.
+- A boot cmdline with a hardcoded device path.
+- An initrd change that drops `loop`, `dm-verity`, `erofs`, or `virtio_net`
+  (the build fails the check in `bluefin-server-boot.bst`).
+- A new release asset that is not added to `SHA256SUMS` in
+  `oci/bluefin-server-image.bst`.
+- Keys committed anywhere outside the gitignored `files/boot-keys/`, other
+  than the public INSECURE dev module pair in `files/dev-keys/`.
+- A new `KNOWN_BROKEN` waiver in `check-image.py` to get a prune past CI.
 
 ## Verification
 
 - [ ] `just validate` resolves the BuildStream graph without errors.
-- [ ] No `installer-knuckle.bst` or custom installer service units exist.
-- [ ] UKI boot cmdline points to `systemd.unit=system-install.target`.
-- [ ] Serial console `console=ttyS0,115200` is the final console argument.
-- [ ] `installer-stack.bst` explicitly includes XFS and vfat support.
-- [ ] `bluefin-server-installer.bst` asserts the existence of critical tools
-      (`udevadm`, `lsblk`, `systemd-repart`, `bootctl`, `systemd-sysinstall`).
-- [ ] The live installer does not bake hardcoded SSH keys or pre-hashed root
-      passwords.
-- [ ] The DDI is decompressed after the cpio step.
-- [ ] `files/installer/repart.d/20-root-a.conf` has `GrowFileSystem=yes`.
+- [ ] `just dogfood-check` passes.
+- [ ] `just dogfood-install NEXT=<dir>` passes when changing install or update logic.
+- [ ] `just check-image` passes after changing `files/prune/` or a composed stack.
+- [ ] Exported `dist/diskless/` contains the OS DDI, both UKIs, the netboot
+      ESP, the sysext assets, `efi-keys/`, `SHA256SUMS`, and `SHA256SUMS.gpg`.
 
 ## See also
 
-- [ddi-installer.md](ddi-installer.md) — installer architecture and repart configuration.
-- [CONTEXT.md](../../CONTEXT.md) — canonical project domain glossary (OS DDI, Installer terminology).
+- [ddi-installer.md](ddi-installer.md) — boot, install, and update architecture.
+- [CONTEXT.md](../../CONTEXT.md) — canonical project domain glossary (OS DDI, Installer, Netboot UKI, Disk UKI).

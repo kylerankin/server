@@ -1,0 +1,15 @@
+[Unit]
+Description=Show Update Health on the Login Banners
+Documentation=file:/usr/libexec/bluefin-update-status man:systemd-sysupdate(8)
+# Installed nodes only, like systemd-sysupdate.service.d/10-diskless.conf:
+# diskless nodes and the USB installer have no slots to update.
+ConditionPathExists=!/run/machines/rootdisk.raw
+ConditionKernelCommandLine=!root=tmpfs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/bluefin-update-status
+StateDirectory=bluefin-update-status
+
+[Install]
+WantedBy=multi-user.target

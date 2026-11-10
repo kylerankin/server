@@ -1,0 +1,36 @@
+# The default Gateway, exposed through a MetalLB LoadBalancer Service: HTTP
+# on port 80 and HTTPS on port 443 with the homelab-tls Secret in this
+# namespace (45-cert-manager/23-gateway-cert.yaml). Without cert-manager the
+# https listener has no certificate and the add-ons are unreachable.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: envoy
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: homelab
+  namespace: envoy-gateway-system
+spec:
+  gatewayClassName: envoy
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: All
+  - name: https
+    protocol: HTTPS
+    port: 443
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: homelab-tls
+        kind: Secret
+    allowedRoutes:
+      namespaces:
+        from: All

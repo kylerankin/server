@@ -1,0 +1,66 @@
+# The Console's session-creating endpoints, behind the Gateway's login
+# password (user admin, Secret kubestellar-console-login): /auth/github (the
+# built-in admin sign-in without an OAuth app, else the start of GitHub's)
+# and the GitHub App manifest flow. Everything else goes through
+# 20-httproute.yaml and needs the session cookie these set.
+#
+# Exact matches outrank 20-httproute.yaml's "/" prefix (Gateway API route
+# precedence). The Console's router ignores case and a trailing slash, so
+# the regular expression catches those spellings too; Envoy Gateway ranks a
+# RegularExpression above any PathPrefix, and Envoy normalizes the path
+# (dot segments, merged slashes) first; the Console does not unescape it.
+# Applied after the Secrets and before 20-httproute.yaml, the policy first.
+# Pinned to the `https` listener section so the password-protected
+# `/auth/github` request never traverses the plaintext `:80` listener.
+# Strict-Transport-Security (max-age one year, no includeSubDomains, so other
+# devices under <HOMELAB_DOMAIN> are never pinned to HTTPS) makes a browser
+# that has reached this host once go straight to https next time (#389).
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: kubestellar-console-login
+  namespace: kubestellar-console
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: kubestellar-console-login
+  basicAuth:
+    users:
+      name: kubestellar-console-login
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: kubestellar-console-login
+  namespace: kubestellar-console
+spec:
+  parentRefs:
+  - name: homelab
+    namespace: envoy-gateway-system
+    sectionName: https
+  hostnames:
+  - "kubestellar.${HOMELAB_DOMAIN}"
+  rules:
+  - matches:
+    - path:
+        type: Exact
+        value: /auth/github
+    - path:
+        type: Exact
+        value: /auth/manifest/setup
+    - path:
+        type: Exact
+        value: /auth/manifest/callback
+    - path:
+        type: RegularExpression
+        value: "(?i)/+auth/+(github|manifest/+(setup|callback))/*"
+    backendRefs:
+    - name: kubestellar-console
+      port: 8080
+    filters:
+    - type: ResponseHeaderModifier
+      responseHeaderModifier:
+        set:
+        - name: Strict-Transport-Security
+          value: "max-age=31536000"

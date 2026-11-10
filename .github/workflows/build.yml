@@ -1,190 +1,955 @@
-name: Build DDI artifacts
+name: Build image artifacts
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
+  # The merge queue: the full build and boot test of what main will be, for
+  # every merge group that can change the image set.
+  merge_group:
+    types: [checks_requested]
+  # Nightly dev-key build of main with the full boot test (A/B update and
+  # rollback included), which pull requests no longer run by default.
+  schedule:
+    - cron: "30 5 * * *"
   workflow_dispatch:
 
+# Pull requests cancel superseded runs. Pushes to main queue instead: a run
+# on main ends in a release, and cancelling it would skip that version. The
+# nightly build and labels other than full-build get groups of their own, so
+# they neither delay a release nor cancel a pull request's full build.
 concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-${{ github.event_name == 'schedule' && 'nightly' || (github.event.action == 'labeled' && github.event.label.name != 'full-build') && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Least privilege by default: this workflow executes PR-controlled build code
 # (the Justfile and build scripts come from the PR head), so the workflow-wide
-# token is read-only. contents: write is granted per job only where genuinely
-# required (see track-refs and release below).
+# token is read-only. No job that runs on `pull_request` holds a write token;
+# contents: write is granted only to `release`, which is gated to main.
 permissions:
   contents: read
 
 jobs:
-  # Resolves BuildStream junction refs and pushes them back to the PR branch.
-  # This runs PR-controlled code (`just bst source track`) with a write token,
-  # so it keeps the pre-existing renovate/* branch gate. The push updates the
-  # PR branch tip; the build job below runs afterwards and checks out that
-  # updated tip.
-  track-refs:
-    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+  # Decides what this run builds:
+  #  - release: a push or dispatch on main. Release-signed, published.
+  #  - image: the full image build and boot test. Always for releases, the
+  #    nightly schedule and dispatches; for a merge group whenever it can
+  #    change the image set; on a pull request only with the full-build
+  #    label or when it changes the FSDK junction or its patches. Never when
+  #    the change cannot touch the image set (docs, unit tests; see
+  #    .github/scripts/image-build-needed.py). Other pull requests run
+  #    `validate` in minutes and get the full build in the merge queue
+  #    (build-time figures: docs/skills/ci-tooling.md#build-time-and-caches).
+  # A skipped job reports as passing, so `build` and `boot-test-result` can be
+  # required checks without blocking those PRs. The classifier script is
+  # checked out from the base revision, so editing it does not skip the PR's
+  # own build, and changes to it or to this workflow always count as image
+  # changes. This job itself still comes from the PR head's copy of this
+  # file, though: a PR can edit it to skip anything. The control there is
+  # review of workflow changes, not this job.
+  changes:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     permissions:
-      contents: write # pushes resolved refs back to the renovate/* PR branch
+      contents: read
+      pull-requests: read # lists the pull request's changed files
+    outputs:
+      image: ${{ steps.decide.outputs.image }}
+      release: ${{ steps.decide.outputs.release }}
+      validate: ${{ steps.decide.outputs.validate }}
+    steps:
+      - name: Checkout the base revision's scripts
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Decide what to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          ACTION: ${{ github.event.action }}
+          LABEL: ${{ github.event.label.name }}
+          MERGE_BASE: ${{ github.event.merge_group.base_sha }}
+          MERGE_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          image=false release=false validate=false
+          # Before the classifier exists on the base branch, build.
+          build_needed() {
+            if [ -f .github/scripts/image-build-needed.py ]; then
+              python3 .github/scripts/image-build-needed.py < "${RUNNER_TEMP}/changed.txt"
+            else
+              echo true
+            fi
+          }
+          case "${GITHUB_EVENT_NAME}" in
+            push|workflow_dispatch)
+              image=true
+              if [ "${GITHUB_REF}" = refs/heads/main ]; then release=true; fi ;;
+            schedule)
+              image=true ;;
+            merge_group)
+              validate=true
+              gh api --paginate "repos/${GITHUB_REPOSITORY}/compare/${MERGE_BASE}...${MERGE_HEAD}" \
+                --jq '.files[] | .filename, (.previous_filename // empty)' > "${RUNNER_TEMP}/changed.txt"
+              image="$(build_needed)"
+              # The compare API lists at most 300 files; past that, build.
+              if [ "$(wc -l < "${RUNNER_TEMP}/changed.txt")" -ge 300 ]; then image=true; fi ;;
+            pull_request)
+              # Adding an unrelated label changes nothing about the PR.
+              if [ "${ACTION}" != labeled ] || [ "${LABEL}" = full-build ]; then
+                validate=true
+                gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+                  --jq '.[] | .filename, (.previous_filename // empty)' > "${RUNNER_TEMP}/changed.txt"
+                if [ "$(build_needed)" = true ]; then
+                  if jq -e 'index("full-build")' <<< "${PR_LABELS}" > /dev/null \
+                    || grep -qE '^(elements/freedesktop-sdk\.bst|patches/)' "${RUNNER_TEMP}/changed.txt"; then
+                    image=true
+                  fi
+                fi
+              fi ;;
+          esac
+          {
+            echo "image=${image}"
+            echo "release=${release}"
+            echo "validate=${validate}"
+          } >> "$GITHUB_OUTPUT"
+          echo "image=${image} release=${release} validate=${validate}"
+
+  # The cheap check every pull request gets: resolves every shipped element
+  # graph and runs the version-invariant checks (`just validate`), with
+  # throwaway keys.
+  validate:
+    needs: changes
+    if: needs.changes.outputs.validate == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.ref || github.ref }}
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          persist-credentials: false
 
       - name: Set up just
-        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
         with:
-          tool: just
+          tool: just@1.59.0
 
-      - name: Track and Resolve BuildStream Refs
+      - name: Generate throwaway keys
+        run: just gen-dev-keys
+
+      - name: Validate Element Graph
+        run: just validate
+
+  # FSDK's kernel is most of a cold build
+  # (docs/skills/ci-tooling.md#build-time-and-caches), and no upstream cache
+  # holds it (our module certificate and kernel config patches change its
+  # key). These jobs build it (and Go) with no signing secrets, each against
+  # one committed module certificate, and push the key-free artifacts to the
+  # project CAS unless a remote already holds them; every build pulls them
+  # through project.conf (scripts/kernel-cache.sh):
+  #  - kernel-cache: the release certificate, for release builds;
+  #  - kernel-cache-dev: the public INSECURE dev certificate that
+  #    `just gen-dev-keys` uses (files/dev-keys/), for pull requests, the
+  #    nightly build and local builds. No job needs it, so it never delays
+  #    a release.
+  # The cache only saves time: a failed seed must not hold back the release,
+  # which checks build's and boot-test-result's own results.
+  kernel-cache:
+    needs: changes
+    if: needs.changes.outputs.release == 'true'
+    # CASD_CLIENT_KEY lives in this environment, which only main may use.
+    environment: bst-cache
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up just
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+        with:
+          tool: just@1.59.0
+
+      - name: Set up runner disk space
+        run: bash scripts/ci-runner-disk.sh
+
+      - name: Build and push the kernel cache unless it exists
+        id: seed
+        continue-on-error: true
         env:
-          HEAD_REF: ${{ github.head_ref }}
+          CASD_CLIENT_CERT: ${{ vars.CASD_CLIENT_CERT }}
+          CASD_CLIENT_KEY: ${{ secrets.CASD_CLIENT_KEY }}
+        run: bash scripts/kernel-cache.sh seed release
+
+      # continue-on-error turns the job green; say so, or a cache that never
+      # seeds goes unnoticed while every build compiles the kernel.
+      - name: Report a failed seed
+        if: steps.seed.outcome == 'failure'
         run: |
-          set -euo pipefail
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          just bst source track freedesktop-sdk.bst || true
-          just bst source track gnome-build-meta.bst || true
-          if ! git diff --exit-code; then
-            git add elements/
-            git commit -m "chore: resolve BuildStream junction refs to git-describe format" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
-            git push origin "HEAD:${HEAD_REF}"
-          fi
+          msg="The kernel cache seed failed; this release builds the kernel itself. See the step above."
+          echo "::warning title=Kernel cache not seeded::${msg}"
+          echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
+
+  kernel-cache-dev:
+    needs: changes
+    if: needs.changes.outputs.release == 'true'
+    # CASD_CLIENT_KEY lives in this environment, which only main may use.
+    environment: bst-cache
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up just
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+        with:
+          tool: just@1.59.0
+
+      - name: Set up runner disk space
+        run: bash scripts/ci-runner-disk.sh
+
+      - name: Build and push the dev kernel cache unless it exists
+        id: seed
+        continue-on-error: true
+        env:
+          CASD_CLIENT_CERT: ${{ vars.CASD_CLIENT_CERT }}
+          CASD_CLIENT_KEY: ${{ secrets.CASD_CLIENT_KEY }}
+        run: bash scripts/kernel-cache.sh seed dev
+
+      # continue-on-error turns the job green; say so, or a cache that never
+      # seeds goes unnoticed while every build compiles the kernel.
+      - name: Report a failed seed
+        if: steps.seed.outcome == 'failure'
+        run: |
+          msg="The dev kernel cache seed failed; pull requests and the nightly build compile the kernel until a release seeds it. See the step above."
+          echo "::warning title=Kernel cache not seeded::${msg}"
+          echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
+
+  # Installs what the boot test runs and checks every host tool its dogfood
+  # scripts call is there (scripts/ci/dogfood-preflight.sh), in about a
+  # minute, so a missing one fails before the build instead of after it.
+  boot-test-preflight:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.image == 'true' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit `build` builds and boot-test checks out.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          persist-credentials: false
+
+      - name: Install QEMU and OVMF
+        run: bash scripts/ci/install-qemu-ovmf.sh
+
+      - name: Check the boot test's host tools
+        run: bash scripts/ci/dogfood-preflight.sh
 
   build:
-    # Read-only token (workflow default): on pull_request this job checks out
-    # and executes PR-controlled code, so it must never hold a write token.
-    needs: track-refs
-    # track-refs is skipped for non-renovate PRs and pushes; only a failed or
-    # cancelled track job should stop the build.
-    if: ${{ !failure() && !cancelled() }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    needs: [changes, kernel-cache, boot-test-preflight]
+    # Runs when kernel-cache is skipped (non-release builds) or failed: the
+    # cache only saves time. A failed preflight stops it.
+    if: ${{ !cancelled() && needs.changes.outputs.image == 'true' && needs.boot-test-preflight.result == 'success' }}
+    # The signing secrets live in the `release` environment, which only main
+    # may use. Every other build runs with no environment (an empty name):
+    # a pull request asking for `release` would be refused before any step.
+    environment: ${{ needs.changes.outputs.release == 'true' && 'release' || '' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          # The triggering commit, not its branch tip: release and
+          # release-dry-run pair these artifacts with that commit.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          persist-credentials: false
 
       - name: Set up just
-        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
         with:
-          tool: just
+          tool: just@1.59.0
+
+      # Releases from main are signed with the project keys: Secure Boot and
+      # module keys come from BOOT_KEYS_TARBALL (a base64 tarball of
+      # files/boot-keys/), the SHA256SUMS signing key from
+      # SYSUPDATE_SIGNING_KEY, and the image trusts the committed release
+      # keyring. Every other build (pull requests, the nightly build, branch
+      # dispatches) gets throwaway keys and is never published.
+      - name: Install signing keys
+        env:
+          RELEASE: ${{ needs.changes.outputs.release }}
+          BOOT_KEYS_TARBALL: ${{ needs.changes.outputs.release == 'true' && secrets.BOOT_KEYS_TARBALL || '' }}
+          SYSUPDATE_SIGNING_KEY: ${{ needs.changes.outputs.release == 'true' && secrets.SYSUPDATE_SIGNING_KEY || '' }}
+        run: |
+          set -euo pipefail
+          if [ "${RELEASE}" = true ]; then
+            if [ -z "${BOOT_KEYS_TARBALL}" ] || [ -z "${SYSUPDATE_SIGNING_KEY}" ]; then
+              echo "BOOT_KEYS_TARBALL and SYSUPDATE_SIGNING_KEY are required to build releases on main" >&2
+              exit 1
+            fi
+            mkdir -p files/boot-keys
+            echo "${BOOT_KEYS_TARBALL}" | base64 -d | tar -xz -C files/boot-keys
+            # Validate key layout per scripts/gen-dev-keys.sh
+            for f in PK.key PK.crt KEK.key KEK.crt DB.key DB.crt linux-module-cert.key modules/linux-module-cert.crt; do
+              if [ ! -s "files/boot-keys/${f}" ]; then
+                echo "Missing or empty expected key file: files/boot-keys/${f}" >&2
+                exit 1
+              fi
+            done
+            if [ -e files/boot-keys/modules/linux-module-cert.key ]; then
+              echo "Security violation: private linux-module-cert.key must not reside in modules/" >&2
+              exit 1
+            fi
+            # The kernel cache is keyed on the committed copy of the module
+            # certificate; same certificate, so use its exact bytes.
+            if ! cmp -s <(openssl x509 -in files/boot-keys/modules/linux-module-cert.crt -outform der) \
+                        <(openssl x509 -in files/release-keys/linux-module-cert.crt -outform der); then
+              echo "files/release-keys/linux-module-cert.crt is not the module certificate in BOOT_KEYS_TARBALL; update it" >&2
+              exit 1
+            fi
+            cp files/release-keys/linux-module-cert.crt files/boot-keys/modules/linux-module-cert.crt
+            # Never the public INSECURE dev module pair (files/dev-keys/).
+            bash scripts/check-release-keys.sh
+            printf '%s\n' "${SYSUPDATE_SIGNING_KEY}" > files/boot-keys/sysupdate-signing.asc
+            cp files/os/sysupdate-keys/import-pubring.gpg files/boot-keys/import-pubring.pgp
+            # The initrd trusts only the committed Ignition config keyring for
+            # bluefin-node.ign.gpg; its secret key never enters the build.
+            rm -f files/boot-keys/ignition-signing.asc
+            if [ ! -s files/release-keys/ignition-pubring.pgp ]; then
+              echo "files/release-keys/ignition-pubring.pgp is required to build releases" >&2
+              exit 1
+            fi
+            cp files/release-keys/ignition-pubring.pgp files/boot-keys/ignition-pubring.pgp
+            bash scripts/check-ignition-keys.sh --release
+          else
+            just gen-dev-keys
+            bash scripts/check-ignition-keys.sh
+          fi
+
+      # Detached signatures over the boot test's node config: one with the
+      # Ignition config key (applied), one with the image signing key that
+      # signs SHA256SUMS (refused). Releases have no Ignition secret key.
+      - name: Sign the Ignition test config
+        if: needs.changes.outputs.release != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p dist/ignition-sigs
+          bash scripts/sign-node-config.sh files/boot-keys/ignition-signing.asc \
+            tests/fixtures/ignition/apply-marker.ign dist/ignition-sigs/apply-marker.ign.config.gpg
+          bash scripts/sign-node-config.sh files/boot-keys/sysupdate-signing.asc \
+            tests/fixtures/ignition/apply-marker.ign dist/ignition-sigs/apply-marker.ign.release.gpg
+
+      # One version per build, increasing under strverscmp(). Non-release
+      # builds use a 0.* version so they can never sort above a release.
+      - name: Set image version
+        id: version
+        env:
+          RELEASE: ${{ needs.changes.outputs.release }}
+        run: |
+          set -euo pipefail
+          if [ "${RELEASE}" = true ]; then
+            V="$(date -u +%y.%m).${GITHUB_RUN_NUMBER}"
+          else
+            V="0.${GITHUB_RUN_NUMBER}"
+          fi
+          just set-version "${V}"
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up runner disk space
+        run: bash scripts/ci-runner-disk.sh
 
       - name: Validate Element Graph
         run: just validate
 
-      - name: Set up runner disk space
-        run: |
-          set -euo pipefail
-          sudo mkdir -p /mnt/podman /mnt/buildstream
-          sudo chown -R "$USER:$USER" /mnt/podman /mnt/buildstream
-          mkdir -p ~/.config/containers
-          cat > ~/.config/containers/storage.conf <<EOF
-          [storage]
-          driver = "overlay"
-          runroot = "/run/user/1001"
-          graphroot = "/mnt/podman"
-          EOF
-          mkdir -p ~/.cache
-          ln -sf /mnt/buildstream ~/.cache/buildstream
+      - name: Build and export the image set
+        run: just export-image
 
-      - name: Build and export DDI OS image
-        run: |
-          just build-ddi
-          just export-ddi
-
-      - name: Build and export live installer & target UKI, and PXE boot inputs
-        run: |
-          just build-installer
-          just export-pxe
-
-      - name: Build and export k0s systemd-sysext
-        run: |
-          just build-sysext
-          just export-sysext
-
-
-      - name: Build and export Flatcar LTS Kernel & ZFS
-        run: |
-          just build-kernel
-          just build-zfs
-          just export-kernel
-      - name: Sign release SHA256SUMS manifest
-        if: github.ref == 'refs/heads/main'
-        env:
-          SYSUPDATE_SIGNING_KEY: ${{ secrets.SYSUPDATE_SIGNING_KEY }}
-        run: |
-          set -euo pipefail
-          # systemd-sysupdate fetches <Path>/SHA256SUMS as the version
-          # manifest, so all release assets must share one combined,
-          # flat manifest at the release root.
-          mkdir -p dist/release
-          cp dist/bluefin-server-installer-*.raw.zst dist/bluefin-server-*.efi dist/release/
-          cp dist/bluefin-server-pxe-vmlinuz-* dist/bluefin-server-pxe-initrd-*.cpio.gz dist/release/
-          cp dist/ddi/bluefin-server-ddi-*.raw.zst dist/release/
-          cp dist/sysext/k0s-*.raw.zst dist/release/
-          if [ -d dist/kernel ]; then
-            cp dist/kernel/usr/lib/sysexts/*.raw dist/release/ 2>/dev/null || true
-          fi
-          (cd dist/release && sha256sum --binary -- * > SHA256SUMS)
-          GNUPGHOME=$(mktemp -d)
-          export GNUPGHOME
-          trap 'rm -rf "$GNUPGHOME"' EXIT
-          echo "$SYSUPDATE_SIGNING_KEY" | gpg --batch --import
-          gpg --batch --yes --detach-sign --armor -o dist/release/SHA256SUMS.gpg dist/release/SHA256SUMS
-
-      - name: Resolve release version
-        if: github.ref == 'refs/heads/main'
-        id: version
-        run: echo "version=$(just version)" >> "$GITHUB_OUTPUT"
-
-      # Hand the signed assets to the release job below; the build job itself
-      # stays read-only, so it cannot publish the release.
-      - name: Upload release assets artifact
-        if: github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      # The image set carries its own signed SHA256SUMS(.gpg) covering the
+      # OS images, UKIs and the k0s/KubeStellar/OpenZFS sysexts. It is
+      # uploaded in parts, so each boot-test bucket downloads only what its
+      # scripts read; image-check, release and release-dry-run merge every
+      # image-set-* part back into dist/diskless/. image-set-core is the
+      # catch-all: it excludes exactly what the other parts include, so a new
+      # file always lands in some part.
+      - name: Upload the image set (core)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-assets
-          path: dist/release/
+          name: image-set-core
+          path: |
+            dist/diskless/
+            !dist/diskless/bluefin-server_*.raw
+            !dist/diskless/bluefin-server-netboot_*
+            !dist/diskless/bluefin-server-installer_*.raw
+            !dist/diskless/*.usr.raw
+            !dist/diskless/*.usr-verity.raw
+            !dist/diskless/bluefin-server-[0-9]*.efi
+            !dist/diskless/*.raw.zst
           if-no-files-found: error
           retention-days: 1
 
-  # Publishes the signed assets to the GitHub Release. Only runs on
-  # pushes/dispatches to main, where the code is already reviewed, and is the
-  # only job besides track-refs that holds contents: write.
-  release:
-    if: ${{ !failure() && !cancelled() && github.ref == 'refs/heads/main' }}
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: write # creates the GitHub Release and uploads its assets
-    steps:
-      - name: Download release assets
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      # What dogfood-diskless.sh boots: the OS DDI and the netboot UKI and ESP.
+      - name: Upload the image set (netboot)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-assets
-          path: dist/release
+          name: image-set-netboot
+          path: |
+            dist/diskless/bluefin-server_*.raw
+            dist/diskless/bluefin-server-netboot_*
+            !dist/diskless/*.usr.raw
+            !dist/diskless/*.usr-verity.raw
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Upload assets to GitHub Release
+      - name: Upload the image set (installer)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-set-installer
+          path: dist/diskless/bluefin-server-installer_*.raw
+          if-no-files-found: error
+          retention-days: 1
+
+      # The OS's sysupdate sources: usr and verity slots, disk UKI.
+      - name: Upload the image set (sysupdate)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-set-sysupdate
+          path: |
+            dist/diskless/*.usr.raw
+            dist/diskless/*.usr-verity.raw
+            dist/diskless/bluefin-server-[0-9]*.efi
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the image set (sysexts)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-set-sysexts
+          path: dist/diskless/*.raw.zst
+          if-no-files-found: error
+          retention-days: 1
+
+      # The A/B update and boot-counted rollback test needs two more image
+      # sets that sort above this one. Only the version differs, so each is a
+      # warm rebuild of the version-stamped elements. Not in releases: these
+      # would be release-signed versions nobody publishes.
+      # 1.<run>.N, not 0.<run>.N: systemd-sysinstall's boot entry for the
+      # installed 0.<run> carries `version 1.0.<run>`, and systemd-boot would
+      # keep defaulting to it over a 0.<run>.N update. 1.<run>.N sorts above
+      # both and still below every release (YY.MM.<run>).
+      # The next set is built as after the cut-over of #327
+      # (ignition_allow_unsigned off): the update tests boot only its disk
+      # UKI, and the boot test proves its netboot UKI refuses an unsigned
+      # bluefin-node.ign.
+      - name: Build the next and broken image sets
+        if: needs.changes.outputs.release != 'true'
+        run: |
+          set -euo pipefail
+          just set-version "1.${GITHUB_RUN_NUMBER}.1"
+          BST_FLAGS="-o ignition_allow_unsigned False" just export-image dist/diskless-next
+          just set-version "1.${GITHUB_RUN_NUMBER}.2"
+          just export-image dist/diskless-broken
+
+      # The update tests never boot an installer, so those sets go without
+      # it. The next set is split like the image set: the diskless bucket
+      # boots only its netboot files (image-next-boot, the catch-all), the
+      # update tests also need its sysupdate sources (image-next-update).
+      - name: Upload the next image set (boot)
+        if: needs.changes.outputs.release != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-next-boot
+          path: |
+            dist/diskless-next/
+            !dist/diskless-next/bluefin-server-installer_*.raw
+            !dist/diskless-next/*.usr.raw
+            !dist/diskless-next/*.usr-verity.raw
+            !dist/diskless-next/bluefin-server-[0-9]*.efi
+            !dist/diskless-next/*.raw.zst
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the next image set (update)
+        if: needs.changes.outputs.release != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-next-update
+          path: |
+            dist/diskless-next/*.usr.raw
+            dist/diskless-next/*.usr-verity.raw
+            dist/diskless-next/bluefin-server-[0-9]*.efi
+            dist/diskless-next/*.raw.zst
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the broken image set
+        if: needs.changes.outputs.release != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-broken
+          path: |
+            dist/diskless-broken/
+            !dist/diskless-broken/bluefin-server-installer_*.raw
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the Ignition test config signatures
+        if: needs.changes.outputs.release != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ignition-sigs
+          path: dist/ignition-sigs/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Secure Boot QEMU boots of the built images: diskless (network pull,
+  # dm-verity /usr, tmpfs root), refusal of a tampered image or manifest,
+  # UEFI HTTP boot, Ignition applying a config, diskless ->
+  # systemd-sysinstall -> disk and the offline USB installer; outside
+  # releases also A/B update and rollback. The scenarios live in
+  # scripts/ci/boot-test.sh, in buckets balanced by duration that run in
+  # parallel, one runner each; boot-test-result is their one gate.
+  boot-test:
+    needs: [changes, build]
+    # build needs kernel-cache, which is skipped outside release builds; a
+    # skipped job anywhere upstream skips this one unless it checks build's
+    # own result.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    strategy:
+      # Every bucket reports, so one failure does not hide another.
+      fail-fast: false
+      matrix:
+        scenario: [diskless, install, installer, installer-disks]
+        # What each bucket's scenarios read, so it downloads only that:
+        # `image` the image-set parts for dist/diskless (dogfood-diskless.sh
+        # and dogfood-install.sh boot netboot, dogfood-installer.sh the
+        # installer); outside releases `next` the image-next parts for
+        # dist/diskless-next, `broken` dist/diskless-broken and `sigs`
+        # dist/ignition-sigs.
+        include:
+          - scenario: diskless
+            image: image-set-{core,netboot}
+            next: image-next-boot
+            broken: false
+            sigs: true
+          - scenario: install
+            image: image-set-{core,netboot}
+            next: image-next-*
+            broken: true
+            sigs: false
+          - scenario: installer
+            image: image-set-{core,installer}
+            next: image-next-*
+            broken: false
+            sigs: false
+          - scenario: installer-disks
+            image: image-set-{core,installer}
+            next: ""
+            broken: false
+            sigs: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit `build` built, not the branch tip: the harness and
+          # fixtures must match the image set under test.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          persist-credentials: false
+
+      - name: Download image artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: ${{ matrix.image }}
+          merge-multiple: true
+          path: dist/diskless
+
+      - name: Download the next image set
+        if: needs.changes.outputs.release != 'true' && matrix.next != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: ${{ matrix.next }}
+          merge-multiple: true
+          path: dist/diskless-next
+
+      - name: Download the broken image set
+        if: needs.changes.outputs.release != 'true' && matrix.broken
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: image-broken
+          path: dist/diskless-broken
+
+      - name: Download the Ignition test config signatures
+        if: needs.changes.outputs.release != 'true' && matrix.sigs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ignition-sigs
+          path: dist/ignition-sigs
+
+      - name: Install QEMU and OVMF
+        run: bash scripts/ci/install-qemu-ovmf.sh
+
+      - name: Record installer artifact identity
+        if: matrix.scenario == 'installer'
+        run: |
+          {
+            git rev-parse HEAD
+            sha256sum dist/diskless/bluefin-server-installer_*.raw \
+              dist/diskless/SHA256SUMS dist/diskless/SHA256SUMS.gpg
+          } > dist/installer-artifact-identity.txt
+
+      - name: Boot test (${{ matrix.scenario }})
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE: ${{ needs.changes.outputs.release }}
+          SCENARIO: ${{ matrix.scenario }}
+        run: bash scripts/ci/boot-test.sh "${SCENARIO}"
+
+      - name: Upload boot logs
+        # Keep successful console proof too, and partial evidence on failure.
+        if: ${{ always() && (matrix.scenario == 'installer' || failure()) }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: boot-test-logs-${{ matrix.scenario }}
+          path: |
+            dist/*/dogfood-*.log
+            dist/dogfood-install/*.log
+            dist/dogfood-installer/*.log
+            dist/dogfood-installer-*/*.log
+            dist/dogfood-installer-console-failure/*.failure.screen.txt
+            dist/installer-artifact-identity.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The one result of every boot-test bucket, for `release`, the nightly
+  # report and branch protection. Skipped (which reports as passing) when
+  # nothing was built, like boot-test itself; once build succeeded, it fails
+  # unless every bucket passed.
+  boot-test-result:
+    needs: [build, boot-test]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Check every boot-test bucket passed
+        env:
+          RESULT: ${{ needs.boot-test.result }}
+        run: |
+          if [ "${RESULT}" != success ]; then
+            echo "::error title=boot-test::boot-test result: ${RESULT}"
+            exit 1
+          fi
+
+  # Pruning guard: every library, dlopen dependency and unit/udev program the
+  # /usr image, initrd and sysexts reference must still ship. The step summary
+  # lists /usr paths added and removed since the latest release, and the size
+  # of every file against it (scripts/ci/image-sizes.py); release and
+  # release-dry-run publish that size report with the set.
+  image-check:
+    needs: [changes, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          persist-credentials: false
+
+      # Every part of the image set, merged back into the set as built.
+      - name: Download image artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: image-set-*
+          merge-multiple: true
+          path: dist/diskless
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends erofs-utils binutils cpio zstd
+
+      - name: Download the latest release's /usr image and size report
+        env:
+          GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          V="${{ needs.build.outputs.version }}"
-          TAG="installer-v${V}"
-          echo "Uploading release assets for tag: ${TAG}"
-          gh release create "${TAG}" --title "Bluefin Server v${V}" --notes "Automated release triggered by Renovate dependency update on main" --prerelease=false || true
-          gh release upload "${TAG}" \
-            dist/release/* \
-            --clobber
+          mkdir -p baseline
+          gh release download --pattern '*.usr.raw' --dir baseline \
+            || echo "No previous release; skipping the /usr diff."
+          gh release download --pattern '*.size.json' --dir baseline \
+            || echo "The latest release has no size report; comparing usr_raw only."
+
+      - name: Check image references
+        run: |
+          set -euo pipefail
+          args=(dist/diskless)
+          base="$(find baseline -name '*.usr.raw' | head -n1)"
+          [ -n "${base}" ] && args+=(--baseline-usr "${base}")
+          python3 .github/scripts/check-image.py "${args[@]}"
+
+      # Informational: growth over 5 % or 5 MiB is a warning, never a failure,
+      # and the report stays outside the signed SHA256SUMS.
+      - name: Measure image sizes
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          args=(dist/diskless)
+          usr="$(find baseline -name '*.usr.raw' | head -n1)"
+          if [ -n "${usr}" ]; then args+=(--baseline-usr "${usr}"); fi
+          report="$(find baseline -name '*.size.json' | head -n1)"
+          if [ -n "${report}" ]; then args+=(--baseline-json "${report}"); fi
+          mkdir -p size-report
+          python3 scripts/ci/image-sizes.py "${args[@]}" > "size-report/bluefin-server_${VERSION}.size.json"
+
+      - name: Upload the size report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-size
+          path: size-report/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Publishes the signed image set as a new, immutable GitHub Release and as
+  # an ORAS OCI artifact (one layer per file, tags <version> and, unless a
+  # newer version is already published, latest), each
+  # with SLSA build provenance and SBOM attestations. Only runs for releases
+  # (pushes/dispatches to main, where the code is already reviewed), and is
+  # the only job in this workflow that holds write tokens. Every publish
+  # command is scripts/publish-release.sh, which release-dry-run rehearses on
+  # each pull request that builds.
+  release:
+    # Explicit results, not !failure(): a failed kernel-cache (only a cache)
+    # must not hold back a release, and nothing but a built, boot-tested and
+    # image-checked set may publish.
+    if: ${{ !cancelled() && needs.changes.outputs.release == 'true' && needs.build.result == 'success' && needs.boot-test-result.result == 'success' && needs.image-check.result == 'success' }}
+    needs: [changes, build, boot-test-result, image-check]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: write # creates the GitHub Release and uploads its assets
+      packages: write # pushes the OCI artifact and its attestations to ghcr.io
+      id-token: write # Sigstore signing certificate for the attestations
+      attestations: write # stores the attestations with the repository
+      artifact-metadata: write # storage record for the attested ghcr.io artifact
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Every part of the image set, merged back into the set as built.
+      - name: Download image artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: image-set-*
+          merge-multiple: true
+          path: dist/diskless
+
+      - name: Download the size report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: image-size
+          path: dist/diskless
+
+      # Against the committed release keyring, not the build's own copy.
+      - name: Verify the release set
+        id: verify
+        run: bash scripts/publish-release.sh verify dist/diskless "${VERSION}" files/os/sysupdate-keys/import-pubring.gpg
+
+      # A merge that edits this workflow while the run is queued leaves
+      # GITHUB_TOKEN unable to tag this commit; the newer run then publishes
+      # the content and every step below is skipped (see the script).
+      - name: Check this commit can still be tagged
+        id: taggable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/publish-release.sh taggable "${VERSION}"
+
+      - name: Attest build provenance of the release files
+        if: steps.taggable.outputs.publish == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ steps.verify.outputs.subjects }}
+
+      - name: Attest the SBOM of the release files
+        if: steps.taggable.outputs.publish == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ steps.verify.outputs.subjects }}
+          sbom-path: dist/diskless/bluefin-server_${{ env.VERSION }}.spdx.json
+
+      - name: Create GitHub Release
+        if: steps.taggable.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/publish-release.sh release dist/diskless "${VERSION}"
+
+      # setup-oras v2.0.1's built-in release table stops at ORAS 1.3.3, so pin
+      # the release the Justfile's oras_image names, by URL and checksum.
+      - name: Set up oras
+        if: steps.taggable.outputs.publish == 'true'
+        uses: oras-project/setup-oras@5e2f2482b30b0cb3e14e67f89a80c88c659a7c63 # v2.0.3
+        with:
+          url: https://github.com/oras-project/oras/releases/download/v1.3.6/oras_1.3.6_linux_amd64.tar.gz
+          checksum: 66fb0ad7206f3f6fa77ed5b552049d364ccf4b50b1684554f731f76302b52ca0
+
+      - name: Push OCI artifact
+        if: steps.taggable.outputs.publish == 'true'
+        id: oci
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "${GITHUB_TOKEN}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          bash scripts/publish-release.sh oci dist/diskless "${VERSION}" "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/bluefin-server"
+
+      # push-to-registry stores the signed attestation next to the artifact
+      # as an OCI referrer, verifiable with gh attestation or cosign.
+      - name: Attest build provenance of the OCI artifact
+        if: steps.taggable.outputs.publish == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.oci.outputs.name }}
+          subject-digest: ${{ steps.oci.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest the SBOM of the OCI artifact
+        if: steps.taggable.outputs.publish == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.oci.outputs.name }}
+          subject-digest: ${{ steps.oci.outputs.digest }}
+          sbom-path: dist/diskless/bluefin-server_${{ env.VERSION }}.spdx.json
+          push-to-registry: true
+
+  # Rehearses `release` on every pull request and merge group that builds, with the same
+  # scripts/publish-release.sh commands: verifies the release set against the
+  # keyring the build trusted (a throwaway key on pull requests), renders the
+  # gh release command without running it, and pushes the OCI artifact to a
+  # local registry and pulls it back. No secrets, read-only token.
+  release-dry-run:
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.build.result == 'success' }}
+    needs: [build, image-check]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    services:
+      registry:
+        image: docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c
+        ports:
+          - 5000:5000
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Same commit as `build`: the branch tip may have moved mid-run.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          persist-credentials: false
+
+      # Every part of the image set, merged back into the set as built.
+      - name: Download image artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: image-set-*
+          merge-multiple: true
+          path: dist/diskless
+
+      # Only image-check's success uploads it; the rehearsal runs either way.
+      - name: Download the size report
+        if: needs.image-check.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: image-size
+          path: dist/diskless
+
+      - name: Verify the release set
+        run: bash scripts/publish-release.sh verify dist/diskless "${VERSION}" dist/diskless/sysupdate-keys/import-pubring.pgp
+
+      # Reads the published releases to decide --latest, like `release`.
+      - name: Render the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/publish-release.sh release dist/diskless "${VERSION}" --dry-run
+
+      # setup-oras v2.0.1's built-in release table stops at ORAS 1.3.3, so pin
+      # the release the Justfile's oras_image names, by URL and checksum.
+      - name: Set up oras
+        uses: oras-project/setup-oras@5e2f2482b30b0cb3e14e67f89a80c88c659a7c63 # v2.0.3
+        with:
+          url: https://github.com/oras-project/oras/releases/download/v1.3.6/oras_1.3.6_linux_amd64.tar.gz
+          checksum: 66fb0ad7206f3f6fa77ed5b552049d364ccf4b50b1684554f731f76302b52ca0
+
+      - name: Push the OCI artifact to a local registry and pull it back
+        run: bash scripts/publish-release.sh oci dist/diskless "${VERSION}" localhost:5000/bluefin-server --plain-http --pull-back
+
+  # Nightly failures block nothing, so nobody sees them unless this says so:
+  # one open "Nightly build failing" issue gets a comment per failed nightly
+  # run and is closed by the next one that passes. Schedule events only (so
+  # the scheduled main checkout); the job holds nothing but issues: write and
+  # runs only .github/scripts/tracking-issue.sh, shared with the trackers.
+  nightly-status:
+    needs: [changes, build, boot-test-result, image-check]
+    if: ${{ !cancelled() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - name: Checkout the tracking-issue script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/tracking-issue.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Open, update or close the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FAILED: ${{ contains(needs.*.result, 'failure') }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash .github/scripts/tracking-issue.sh "Nightly build failing" "The nightly build of main" "a later nightly build"

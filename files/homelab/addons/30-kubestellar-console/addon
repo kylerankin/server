@@ -1,0 +1,5 @@
+# Homelab add-on (kubestellar sysext): the KubeStellar Console. Signs in as
+# its built-in admin behind the Gateway's login password, or with GitHub
+# once an OAuth app is in /etc/bluefin/homelab.d/kubestellar-console/ (see
+# "secrets"). HOMELAB_KUBESTELLAR_CONSOLE=yes|no overrides the default.
+on kubeadm,k0s

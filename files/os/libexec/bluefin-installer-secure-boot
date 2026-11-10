@@ -1,0 +1,265 @@
+#!/usr/bin/bash
+# bluefin-installer-secure-boot — decide, before the USB installer erases
+# anything, whether systemd-sysinstall may run on this machine's firmware.
+#
+# bluefin-installer-secure-boot.service runs it ahead of systemd-sysinstall
+# (and of the Homelab entries' prompt); sysinstall Requires= it, so a non-zero
+# exit means sysinstall never starts and no disk is touched. It only reads the
+# firmware's Secure Boot state and asks; the install itself stays stock
+# systemd-sysinstall.
+#
+#   Secure Boot on, firmware db holds the stick's db certificate
+#       ("our keys"): continue silently.
+#   Setup Mode (no keys enrolled): offer systemd-boot's own enrollment of the
+#       stick's keys (loader/keys/auto, the "Enroll Secure Boot keys: auto"
+#       menu entry): set it as the one-shot entry and restart. The stick then
+#       boots again with Secure Boot on and this check passes.
+#   Secure Boot off, or on with other keys (for example Microsoft's only),
+#       or a state that cannot be read: explain what to change in the
+#       firmware, then Cancel (the default: Enter, end of input, or no answer
+#       within the timeout) or Continue without Secure Boot, which needs a
+#       typed "yes".
+#
+# "Our keys": the firmware's db variable contains, byte for byte, an X.509
+# certificate from the stick's loader/keys/auto/db.auth (the enrollment
+# payload systemd-boot writes), so a machine that trusts only other vendors
+# never passes as enforcing.
+#
+# Unattended installs (a systemd.unit-dropin.systemd-sysinstall.service
+# credential) never prompt: anything but "Secure Boot on with our keys"
+# cancels, unless the bluefin.install-allow-insecure-boot credential is
+# 1/yes/true/on. That credential also answers the console question.
+#
+# Exit status: 0 install, 1 cancelled (or restarting to enroll).
+#
+# Test overrides: BLUEFIN_EFIVARS (efivarfs), BLUEFIN_INSTALLER_KEYS (the
+# stick's loader/keys/auto), BLUEFIN_SECURE_BOOT_TIMEOUT (seconds to wait for
+# an answer).
+
+set -uo pipefail
+export LC_ALL=C
+
+PROG="${0##*/}"
+efivars="${BLUEFIN_EFIVARS:-/sys/firmware/efi/efivars}"
+keys="${BLUEFIN_INSTALLER_KEYS:-/run/bluefin/installer/loader/keys/auto}"
+timeout="${BLUEFIN_SECURE_BOOT_TIMEOUT:-600}"
+creds="${CREDENTIALS_DIRECTORY:-}"
+
+GLOBAL=8be4df61-93ca-11d2-aa0d-00e098032b8c
+DB=d719b2cb-3d3a-4596-a3bc-dad00e67656f
+LOADER=4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+# EFI_CERT_X509_GUID as stored (little-endian fields)
+X509="a1 59 c0 a5 e4 94 a7 4a 87 b5 ab 15 5c 2b f0 72"
+ENROLL_ENTRY=secure-boot-keys-auto
+ALLOW=bluefin.install-allow-insecure-boot
+
+log() { printf '%s: %s\n' "${PROG}" "$*" >&2; }
+say() { printf '%s\n' "$@"; }
+
+# efi_u8 <name-guid>: the first data byte of an EFI variable (efivarfs puts
+# 4 attribute bytes first), or nothing if it is missing.
+efi_u8() {
+    local v
+    v="$(od -An -tu1 -j4 -N1 "${efivars}/$1" 2>/dev/null)" || return 0
+    printf '%s' "${v// /}"
+}
+
+# hex_bytes <file>: " xx xx ... xx " (single spaces), so a byte string only
+# matches another on byte boundaries.
+hex_bytes() {
+    local h
+    h="$(od -An -v -tx1 "$1" 2>/dev/null | tr -s ' \n' '  ')" || return 1
+    [ -n "${h// /}" ] || return 1
+    printf ' %s ' "${h# }" | tr -s ' '
+}
+
+# certs_in_auth <db.auth>: every X.509 certificate of the
+# EFI_VARIABLE_AUTHENTICATION_2 payload's EFI_SIGNATURE_LISTs, one per line,
+# in hex_bytes form.
+certs_in_auth() {
+    local -a b
+    read -ra b <<< "$(od -An -v -tx1 "$1" 2>/dev/null | tr '\n' ' ')"
+    local n=${#b[@]} i list hdr size s
+    u32() { echo $(( 16#${b[$1+3]}${b[$1+2]}${b[$1+1]}${b[$1]} )); }
+    (( n >= 24 )) || return 1
+    # EFI_TIME (16 bytes), then WIN_CERTIFICATE_UEFI_GUID of dwLength bytes
+    i=$(( 16 + $(u32 16) ))
+    while (( i + 28 <= n )); do
+        list=$(u32 $(( i + 16 ))) hdr=$(u32 $(( i + 20 ))) size=$(u32 $(( i + 24 )))
+        (( list >= 28 && size > 16 && i + list <= n )) || return 1
+        if [ "${b[*]:i:16}" = "${X509}" ]; then
+            for (( s = i + 28 + hdr; s + size <= i + list; s += size )); do
+                # EFI_SIGNATURE_DATA: owner GUID (16 bytes), then the DER
+                printf ' %s \n' "${b[*]:s+16:size-16}"
+            done
+        fi
+        i=$(( i + list ))
+    done
+}
+
+# db_has_our_cert: the firmware db holds a certificate from the stick's db.auth.
+db_has_our_cert() {
+    local db cert found=1
+    db="$(hex_bytes "${efivars}/db-${DB}")" || return 1
+    while IFS= read -r cert; do
+        [ -n "${cert// /}" ] || continue
+        [[ "${db}" == *"${cert}"* ]] && found=0
+    done < <(certs_in_auth "${keys}/db.auth")
+    return "${found}"
+}
+
+# loader_offers_enroll: systemd-boot listed its "Enroll Secure Boot keys:
+# auto" entry for this boot (LoaderEntries, UTF-16, NUL-separated).
+loader_offers_enroll() {
+    local entries want="" c i
+    [ -s "${keys}/db.auth" ] && [ -s "${keys}/KEK.auth" ] && [ -s "${keys}/PK.auth" ] || return 1
+    entries="$(hex_bytes "${efivars}/LoaderEntries-${LOADER}")" || return 1
+    for (( i = 0; i < ${#ENROLL_ENTRY}; i++ )); do
+        c="${ENROLL_ENTRY:i:1}"
+        want+="$(printf '%02x 00 ' "'${c}")"
+    done
+    [[ "${entries}" == *" ${want}00 00 "* ]]
+}
+
+# detect_state: enforcing | setup | off | foreign | unsupported | unknown
+detect_state() {
+    local sb setup audit
+    [ -d "${efivars}" ] || { echo unsupported; return; }
+    sb="$(efi_u8 "SecureBoot-${GLOBAL}")"
+    setup="$(efi_u8 "SetupMode-${GLOBAL}")"
+    audit="$(efi_u8 "AuditMode-${GLOBAL}")"
+    if [ -z "${sb}" ] && [ -z "${setup}" ]; then
+        echo unsupported
+    elif [ "${setup}" = 1 ] || [ "${audit}" = 1 ]; then
+        echo setup
+    elif [ ! -s "${keys}/db.auth" ]; then
+        echo unknown
+    elif db_has_our_cert; then
+        if [ "${sb}" = 1 ]; then echo enforcing; else echo off; fi
+    else
+        echo foreign
+    fi
+}
+
+allowed_by_credential() {
+    local v
+    [ -n "${creds}" ] && [ -r "${creds}/${ALLOW}" ] || return 1
+    v="$(tr -d '[:space:]' < "${creds}/${ALLOW}" | tr '[:upper:]' '[:lower:]')"
+    case "${v}" in 1|yes|true|on) return 0 ;; *) return 1 ;; esac
+}
+
+unattended() {
+    local f
+    [ -n "${creds}" ] || return 1
+    for f in "${creds}"/systemd.unit-dropin.systemd-sysinstall.service "${creds}"/systemd.unit-dropin.systemd-sysinstall.service~*; do
+        [ -e "${f}" ] && return 0
+    done
+    return 1
+}
+
+summary() {
+    case "$1" in
+        setup) echo "the firmware is in Setup Mode (no Secure Boot keys are enrolled)" ;;
+        off) echo "Secure Boot is off (the Bluefin Server keys are enrolled)" ;;
+        foreign) echo "the firmware does not trust the Bluefin Server keys (Secure Boot $([ "$(efi_u8 "SecureBoot-${GLOBAL}")" = 1 ] && echo on || echo off), other keys enrolled)" ;;
+        unsupported) echo "the firmware reports no Secure Boot state" ;;
+        *) echo "the Secure Boot state cannot be read" ;;
+    esac
+}
+
+explain() {
+    # A clean screen: boot messages above would push the warning off it.
+    [ ! -t 1 ] || printf '\033[H\033[2J\033[3J'
+    say "=== Bluefin Server: Secure Boot is required ===" ""
+    say "This machine is not ready to run Bluefin Server with Secure Boot:" "  $(summary "$1")." ""
+    say "Bluefin Server boots only signed code: the firmware checks systemd-boot" \
+        "and the kernel image, which pins the verified /usr. Without Secure Boot" \
+        "nothing checks them, so anyone who can write to the disk can change what" \
+        "runs, and secrets sealed to the TPM are not protected." ""
+    case "$1" in
+        setup)
+            say "To fix it, enroll the Bluefin Server keys from this installer, or with" \
+                "\"Enroll Secure Boot keys: auto\" in the stick's boot menu. The firmware" \
+                "then trusts only these keys: add-in cards whose firmware is signed by" \
+                "Microsoft (some graphics cards) may stop working at boot." ;;
+        off)
+            say "To fix it, restart into the firmware setup (usually F2, Del, F10 or Esc" \
+                "while the machine starts), set Secure Boot to Enabled, save, and boot" \
+                "this stick again." ;;
+        *)
+            say "To fix it, restart into the firmware setup (usually F2, Del, F10 or Esc" \
+                "while the machine starts). Under Secure Boot, choose Setup Mode" \
+                "(\"Reset to Setup Mode\", \"Clear Secure Boot keys\" or \"Delete all" \
+                "keys\"), keep Secure Boot Enabled, save, and boot this stick again: the" \
+                "installer then offers to enroll the Bluefin Server keys." ;;
+    esac
+    say ""
+}
+
+cancel() {
+    log "installation cancelled: $*"
+    say "" "Installation cancelled: $*." \
+        "No disk was changed. Change the firmware settings above and boot this" \
+        "stick again (Ctrl-Alt-Del restarts)." ""
+    exit 1
+}
+
+proceed_insecure() {
+    log "continuing without Secure Boot ($1): $(summary "${state}")"
+    say "Continuing without Secure Boot ($1)." ""
+    exit 0
+}
+
+# ask <prompt>: read one line from the console into ${answer}, without
+# whitespace; empty on Enter, end of input or timeout.
+ask() {
+    printf '%s' "$1"
+    answer=""
+    IFS= read -r -t "${timeout}" answer || { printf '\n'; answer=""; }
+    answer="${answer//[[:space:]]/}"
+}
+
+enroll() {
+    say "" "Enrolling the Bluefin Server keys: the machine restarts into systemd-boot," \
+        "which writes them to the firmware (it may count down first; let it)," \
+        "then restarts with Secure Boot on. If it does not boot this stick again," \
+        "pick the stick in the firmware's boot menu. If Secure Boot is still off" \
+        "after that, set it to Enabled in the firmware setup." ""
+    log "Setup Mode: enrolling the stick's keys (one-shot ${ENROLL_ENTRY}) and restarting"
+    bootctl set-oneshot "${ENROLL_ENTRY}" || cancel "systemd-boot's enrollment entry could not be selected"
+    systemctl reboot || cancel "the restart to enroll the keys failed"
+    exit 1
+}
+
+state="$(detect_state)"
+if [ "${state}" = enforcing ]; then
+    log "Secure Boot is on with the Bluefin Server keys"
+    exit 0
+fi
+log "$(summary "${state}")"
+
+if allowed_by_credential; then
+    explain "${state}"
+    proceed_insecure "credential ${ALLOW}"
+fi
+if unattended; then
+    explain "${state}"
+    cancel "unattended install and $(summary "${state}"); set the ${ALLOW}=1 credential to install without Secure Boot"
+fi
+
+explain "${state}"
+enroll_choice=""
+[ "${state}" != setup ] || ! loader_offers_enroll || enroll_choice=2
+say "  1) Cancel: no disk is changed (default)"
+[ -z "${enroll_choice}" ] || say "  2) Enroll the Bluefin Server keys and restart"
+insecure_choice=$(( ${enroll_choice:-1} + 1 ))
+say "  ${insecure_choice}) Continue without Secure Boot" ""
+ask "Choice [1]: "
+if [ -n "${enroll_choice}" ] && [ "${answer}" = "${enroll_choice}" ]; then
+    enroll
+elif [ "${answer}" = "${insecure_choice}" ]; then
+    say "" "Bluefin Server will be installed and boot without Secure Boot."
+    ask 'Type "yes" to continue without Secure Boot: '
+    [ "${answer}" != yes ] || proceed_insecure "confirmed on the console"
+fi
+cancel "Secure Boot is not on with the Bluefin Server keys"

@@ -1,0 +1,58 @@
+#!/usr/bin/bash
+# bluefin-installer-done — the USB installer's last screen.
+#
+# The image's systemd-sysinstall drop-in starts bluefin-installer-done.service
+# when systemd-sysinstall succeeds (OnSuccess=), and that unit restarts the
+# machine when this exits (SuccessAction=reboot, FailureAction=reboot). It
+# says on the monitor that the install is done, when to remove the stick, and
+# what the first start from the disk asks, then waits
+# BLUEFIN_INSTALLER_DONE_TIMEOUT seconds (default 15) or until Enter, so the
+# message is seen before the screen goes blank.
+#
+# The stick comes out only once the screen is blank: /usr of the running
+# installer is on it, and the restart still reads from it. Left in, the
+# firmware normally starts the disk anyway: sysinstall put the new install
+# first in its boot order (--variables=yes).
+#
+# Test overrides: BLUEFIN_OS_RELEASE, BLUEFIN_INSTALLER_DONE_TIMEOUT.
+
+set -uo pipefail
+export LC_ALL=C
+
+PROG="${0##*/}"
+os_release="${BLUEFIN_OS_RELEASE:-/usr/lib/os-release}"
+timeout="${BLUEFIN_INSTALLER_DONE_TIMEOUT:-15}"
+
+version=""
+if [ -r "${os_release}" ]; then
+    while IFS='=' read -r key value; do
+        [ "${key}" = IMAGE_VERSION ] || continue
+        value="${value%\"}"; version="${value#\"}"
+    done < "${os_release}"
+fi
+
+home_server=false
+if [ -n "${CREDENTIALS_DIRECTORY:-}" ] && [ -f "${CREDENTIALS_DIRECTORY}/bluefin.install-home-server" ]; then
+    home_server=true
+fi
+printf '%s: installed, restarting in %ss\n' "${PROG}" "${timeout}" >&2
+if [ "${home_server}" = true ]; then
+    product="Bluefin Home Server"
+else
+    product="Bluefin Server${version:+ ${version}}"
+fi
+printf '%s\n' "" "${product} is installed." "" \
+    "The machine restarts into it in ${timeout} seconds (Enter: now)." \
+    "Remove the USB stick when the screen goes blank." ""
+if [ "${home_server}" = true ]; then
+    printf '%s\n' \
+        "On first boot, create the nonroot owner unless it was privately provisioned." \
+        "Log in as that owner; Homebrew is ready in its system container." \
+        "SSH accepts public keys only. The root account stays locked." ""
+else
+    printf '%s\n' "On its first start the installed system asks here for a new root" \
+        "password; then log in as root with it." ""
+fi
+IFS= read -r -t "${timeout}" _ || true
+printf 'Restarting.\n'
+exit 0

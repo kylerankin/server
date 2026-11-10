@@ -1,0 +1,30 @@
+# The Argo Workflows UI and API on the homelab Gateway at
+# https://argo.<HOMELAB_DOMAIN>. The server runs with --auth-mode=client: every
+# request needs a Kubernetes bearer token (kubectl create token).
+# Pinned to the `https` listener section so the bearer token never
+# traverses the plaintext `:80` listener.
+# Strict-Transport-Security (max-age one year, no includeSubDomains, so other
+# devices under <HOMELAB_DOMAIN> are never pinned to HTTPS) makes a browser
+# that has reached this host once go straight to https next time (#389).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: argo-server
+  namespace: argo
+spec:
+  parentRefs:
+  - name: homelab
+    namespace: envoy-gateway-system
+    sectionName: https
+  hostnames:
+  - "argo.${HOMELAB_DOMAIN}"
+  rules:
+  - backendRefs:
+    - name: argo-server
+      port: 2746
+    filters:
+    - type: ResponseHeaderModifier
+      responseHeaderModifier:
+        set:
+        - name: Strict-Transport-Security
+          value: "max-age=31536000"

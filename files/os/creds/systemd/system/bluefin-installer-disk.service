@@ -1,0 +1,38 @@
+[Unit]
+Description=Choose the disk to install to (USB installer)
+Documentation=file:/usr/libexec/bluefin-installer-disk
+Documentation=https://github.com/projectbluefin/server/blob/main/docs/skills/usb-installer.md
+# Pulled in (Requires=) by the image's systemd-sysinstall drop-in: shows the
+# disks sysinstall can install to with their size and model and hands the
+# chosen one to sysinstall, which still asks for "yes" before it erases it.
+# Cancelled, it fails and sysinstall never starts. After the Secure Boot
+# check and the Homelab entries' prompt; ExecCondition= below skips it when
+# the check did not pass (sysinstall Requires= that too), so a cancelled
+# install asks nothing more.
+After=bluefin-installer-secure-boot.service bluefin-homelab-install.service
+# Condition-skipped on minimal/Homelab; failed on a cancelled Home question.
+# Requires + After prevents the disk question after that cancellation.
+Requires=bluefin-home-server-install.service
+After=bluefin-home-server-install.service
+After=systemd-vconsole-setup.service systemd-firstboot.service
+Wants=bluefin-installer-mute-console.service
+After=bluefin-installer-mute-console.service
+Before=systemd-sysinstall.service
+
+[Service]
+Type=oneshot
+# Active until the machine reboots, so its runtime directory, which holds
+# what systemd-sysinstall reads, stays.
+RemainAfterExit=yes
+RuntimeDirectory=bluefin-installer-disk
+RuntimeDirectoryMode=0700
+# An unattended install's drop-in names the disk itself: no question then.
+ImportCredential=systemd.unit-dropin.systemd-sysinstall.service*
+ExecCondition=/usr/bin/systemctl is-active --quiet bluefin-installer-secure-boot.service
+ExecStart=/usr/libexec/bluefin-installer-disk
+# On the monitor, like sysinstall and the other prompts (the installer UKI
+# puts console=tty0 last, so /dev/console is tty1).
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/console

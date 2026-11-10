@@ -1,0 +1,23 @@
+[Unit]
+Description=Show that the install is done, then restart (USB installer)
+Documentation=file:/usr/libexec/bluefin-installer-done
+Documentation=https://github.com/projectbluefin/server/blob/main/docs/skills/usb-installer.md
+# Started only by the image's systemd-sysinstall drop-in (OnSuccess=), after
+# sysinstall installed the disk and exited. The message stays on the monitor
+# until the restart; however the helper ends, the machine restarts into the
+# installed disk.
+SuccessAction=reboot
+FailureAction=reboot
+Wants=bluefin-installer-mute-console.service
+After=bluefin-installer-mute-console.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/bluefin-installer-done
+ImportCredential=bluefin.install-home-server
+# On the monitor, like sysinstall (the installer UKI puts console=tty0 last,
+# so /dev/console is tty1).
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/console

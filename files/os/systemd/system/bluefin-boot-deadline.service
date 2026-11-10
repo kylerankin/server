@@ -1,0 +1,24 @@
+[Unit]
+Description=Reboot a Boot-Counted Boot That Missed boot-complete.target
+Documentation=file:/usr/libexec/bluefin-boot-deadline man:systemd-bless-boot.service(8)
+ConditionPathExists=/sys/firmware/efi/efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+ConditionPathExists=!/run/machines/rootdisk.raw
+ConditionKernelCommandLine=!root=tmpfs
+# Not ordered after basic.target, multi-user.target or boot-complete.target:
+# the deadline must still fire when the boot hangs before any of them.
+DefaultDependencies=no
+Requires=sysinit.target
+After=sysinit.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/bluefin-boot-deadline
+# The fleet reboot lock (bluefin-reboot-lock): exit 75 means the FleetLock
+# server gave no slot. Try again, re-checking the boot first, until it does;
+# other failures do not restart. A server that cannot be reached does not
+# hold the rollback: the script then reboots without a slot.
+ImportCredential=bluefin.reboot-lock.*
+RestartForceExitStatus=75
+RestartSec=5min

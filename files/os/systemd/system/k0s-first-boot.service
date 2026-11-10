@@ -4,6 +4,10 @@ Wants=network-online.target
 Wants=k0s-first-boot-fetch.service
 After=network-online.target
 After=k0s-first-boot-fetch.service
+# `systemd-sysext refresh` unmerges /usr and merges it again; a module load
+# unit reading /usr/lib/modules meanwhile finds nothing and fails. Let the
+# ones in this boot's transaction finish first (ordering only).
+After=zfs-load-module.service nvidia-load.service
 RequiresMountsFor=/var/lib/k0s
 
 [Service]
@@ -13,9 +17,8 @@ Restart=on-failure
 RestartSec=30s
 ExecStartPre=/usr/bin/test -e /var/lib/k0s/k0s.raw
 ExecStart=/usr/bin/install -D -m 0644 /var/lib/k0s/k0s.raw /run/extensions/k0s.raw
-ExecStart=/usr/bin/systemd-sysext merge
-ExecStart=/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/k0s-manifests.conf
+ExecStart=/usr/bin/systemd-sysext refresh
 ExecStart=/usr/bin/systemctl daemon-reload
-ExecStart=/usr/bin/systemctl enable --now k0scontroller.service
+ExecStart=/usr/bin/sh -c 'if [ -s /etc/k0s/token ]; then exec systemctl enable --now k0sworker.service; else exec systemctl enable --now k0scontroller.service; fi'
 [Install]
 WantedBy=multi-user.target

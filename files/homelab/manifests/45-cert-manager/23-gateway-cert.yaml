@@ -1,0 +1,17 @@
+# The homelab Gateway's certificate for the add-on host names, from the
+# homelab CA, in the Secret homelab-tls its https listener reads. Keep the
+# names in step with the add-on HTTPRoutes.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: homelab-tls
+  namespace: envoy-gateway-system
+spec:
+  secretName: homelab-tls
+  dnsNames:
+  - "argo.${HOMELAB_DOMAIN}"
+  - "mcp.${HOMELAB_DOMAIN}"
+  - "kubestellar.${HOMELAB_DOMAIN}"
+  issuerRef:
+    name: homelab-ca
+    kind: ClusterIssuer

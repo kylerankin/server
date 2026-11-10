@@ -1,0 +1,20 @@
+[Unit]
+Description=Enable the Login Banner Update Status on Updated Nodes
+Documentation=file:/usr/libexec/bluefin-update-status-migrate
+# Presets apply on first boot only, so a node that updated from an image
+# without bluefin-update-status.service never enables it. Enabled in /usr
+# (elements/oci/bluefin-server-usr.bst), so it runs on updated nodes too;
+# once per node. Installed nodes only, like bluefin-update-status.service.
+ConditionPathExists=!/var/lib/bluefin/update-status-migrate.stamp
+ConditionPathExists=!/run/machines/rootdisk.raw
+ConditionKernelCommandLine=!root=tmpfs
+After=systemd-tmpfiles-setup.service
+Before=systemd-user-sessions.service getty.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/bluefin-update-status-migrate
+
+[Install]
+WantedBy=multi-user.target

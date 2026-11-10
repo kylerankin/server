@@ -1,0 +1,38 @@
+[Unit]
+Description=Prepare a Homelab install (USB installer)
+Documentation=file:/usr/libexec/bluefin-homelab-install
+Documentation=https://github.com/projectbluefin/server/blob/main/docs/skills/usb-installer.md
+# Pulled in by the image's systemd-sysinstall drop-in. Only the Homelab
+# entries of the installer's boot menu (installer UKI profiles) set this
+# credential; Home Server and advanced minimal skip this unit and preserve
+# their independent profile selection.
+ConditionCredential=bluefin.install-homelab
+RequiresMountsFor=/run/bluefin/installer
+# The same Secure Boot check as the default entry (systemd-sysinstall
+# Requires= it), before the passphrase prompt. ExecCondition= below skips this
+# unit when the check did not pass, so a cancelled install asks nothing more;
+# a Requires= here would also print "Dependency failed" for this unit on the
+# default entry, where ConditionCredential= skips it anyway.
+After=bluefin-installer-secure-boot.service
+After=systemd-vconsole-setup.service systemd-firstboot.service
+Wants=bluefin-installer-mute-console.service
+After=bluefin-installer-mute-console.service
+Before=systemd-sysinstall.service
+
+[Service]
+Type=oneshot
+# Active until the machine reboots, so its runtime directory, which holds
+# what systemd-sysinstall reads, stays.
+RemainAfterExit=yes
+RuntimeDirectory=bluefin-homelab-install
+RuntimeDirectoryMode=0700
+ImportCredential=bluefin.install-homelab
+ImportCredential=bluefin-cluster.passphrase
+ExecCondition=/usr/bin/systemctl is-active --quiet bluefin-installer-secure-boot.service
+ExecStart=/usr/libexec/bluefin-homelab-install
+# A node asks for the join passphrase on the monitor, like sysinstall
+# (the installer UKI puts console=tty0 last).
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/console

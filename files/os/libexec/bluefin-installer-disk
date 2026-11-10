@@ -1,0 +1,167 @@
+#!/usr/bin/bash
+# bluefin-installer-disk — the USB installer's target-disk question, with each
+# disk's size and model.
+#
+# systemd-sysinstall v261 lists the disks it can install to by one
+# /dev/disk/by-id/ name each, without their size, and pre-fills its input line
+# with the names' common prefix, so choosing one of several disks needs Ctrl-U
+# before the number. bluefin-installer-disk.service runs this before
+# systemd-sysinstall, which Requires= it. It asks systemd-repart for the list
+# sysinstall would show (io.systemd.Repart.ListCandidateDevices with
+# ignoreRoot, so the stick is never listed), shows each disk's number, size,
+# model and name, reads a number, and hands that disk to sysinstall as its
+# device argument: BLUEFIN_INSTALL_TARGET in $RUNTIME_DIRECTORY/sysinstall.env,
+# which the image's sysinstall drop-in reads. sysinstall itself still checks
+# that the install fits, shows its summary and asks for "yes" before it
+# erases anything.
+#
+# Unattended installs (a systemd.unit-dropin.systemd-sysinstall.service
+# credential, whose ExecStart= names the disk) are not asked.
+#
+# Exit status: 0 a disk was chosen (or unattended), 1 cancelled or no disk;
+# sysinstall then does not start.
+#
+# Test overrides: BLUEFIN_VARLINKCTL (the varlinkctl command),
+# BLUEFIN_OS_RELEASE.
+
+set -uo pipefail
+export LC_ALL=C
+
+PROG="${0##*/}"
+varlinkctl="${BLUEFIN_VARLINKCTL:-varlinkctl}"
+os_release="${BLUEFIN_OS_RELEASE:-/usr/lib/os-release}"
+creds="${CREDENTIALS_DIRECTORY:-}"
+out="${RUNTIME_DIRECTORY:?no runtime directory}"
+
+log() { printf '%s: %s\n' "${PROG}" "$*" >&2; }
+say() { printf '%s\n' "$@"; }
+
+cancel() {
+    log "installation cancelled: $*"
+    say "" "Installation cancelled: $*." \
+        "No disk was changed. Ctrl-Alt-Del restarts the installer." ""
+    exit 1
+}
+
+unattended() {
+    local f
+    [ -n "${creds}" ] || return 1
+    for f in "${creds}"/systemd.unit-dropin.systemd-sysinstall.service "${creds}"/systemd.unit-dropin.systemd-sysinstall.service~*; do
+        [ -e "${f}" ] && return 0
+    done
+    return 1
+}
+
+# size <bytes>: 1024-based, one decimal, as systemd prints sizes ("931.5G").
+size() {
+    local b="$1" units=(B K M G T P E) i=0 tenths
+    while [ "${i}" -lt 6 ] && [ "$(( b / (1024 ** (i + 1)) ))" -gt 0 ]; do
+        i=$(( i + 1 ))
+    done
+    if [ "${i}" = 0 ]; then
+        printf '%sB' "${b}"
+        return
+    fi
+    tenths=$(( b * 10 / (1024 ** i) ))
+    if [ $(( tenths % 10 )) = 0 ]; then
+        printf '%s%s' $(( tenths / 10 )) "${units[i]}"
+    else
+        printf '%s.%s%s' $(( tenths / 10 )) $(( tenths % 10 )) "${units[i]}"
+    fi
+}
+
+# field <json> <key>: a string field of one reply, unescaped enough for
+# display (udev strings are ASCII).
+field() {
+    local re="\"$2\":\"(([^\"\\\\]|\\\\.)*)\""
+    [[ "$1" =~ ${re} ]] || return 0
+    local v="${BASH_REMATCH[1]}"
+    v="${v//\\\"/\"}"
+    printf '%s' "${v//\\\\/\\}"
+}
+
+# name <json>: what to show and pass to sysinstall: a /dev/disk/by-id/ name
+# that carries the model (not wwn-* or *eui.*), else any by-id name, else the
+# kernel's node.
+name() {
+    local links="" first="" l re='"symlinks":\[([^]]*)\]'
+    [[ "$1" =~ ${re} ]] && links="${BASH_REMATCH[1]//\"/}"
+    IFS=, read -ra l <<< "${links}"
+    for link in "${l[@]}"; do
+        case "${link}" in
+            /dev/disk/by-id/wwn-* | /dev/disk/by-id/*eui.* | /dev/disk/by-id/nvme-nvme.*) [ -n "${first}" ] || first="${link}" ;;
+            /dev/disk/by-id/*) printf '%s' "${link}"; return ;;
+        esac
+    done
+    printf '%s' "${first:-$(field "$1" node)}"
+}
+
+version=""
+if [ -r "${os_release}" ]; then
+    while IFS='=' read -r key value; do
+        [ "${key}" = IMAGE_VERSION ] || continue
+        value="${value%\"}"; version="${value#\"}"
+    done < "${os_release}"
+fi
+
+: > "${out}/sysinstall.env"
+if unattended; then
+    log "unattended install: the disk is the one its drop-in names"
+    exit 0
+fi
+
+# Clear only before drawing: cancellation and installation errors must remain.
+[ ! -t 1 ] || printf '\033[H\033[2J\033[3J'
+
+nodes=() sizes=() models=()
+re_size='"sizeBytes":([0-9]+)'
+while IFS= read -r reply; do
+    reply="${reply#$'\x1e'}"
+    [ -n "$(field "${reply}" node)" ] || continue
+    n="$(name "${reply}")"
+    [[ "${n}" =~ ^/dev/[[:graph:]]+$ ]] || continue
+    s=""
+    [[ "${reply}" =~ ${re_size} ]] && s="$(size "${BASH_REMATCH[1]}")"
+    m="$(field "${reply}" model)"
+    [ -n "${m}" ] || m="$(field "${reply}" vendor)"
+    m="${m//_/ }"
+    nodes+=("${n}") sizes+=("${s:-?}") models+=("${m:-unknown model}")
+done < <("${varlinkctl}" --more --json=short call exec:/usr/bin/systemd-repart \
+    io.systemd.Repart.ListCandidateDevices '{"ignoreRoot":true}' 2>/dev/null)
+
+count="${#nodes[@]}"
+[ "${count}" -gt 0 ] || cancel "no disk to install to was found (the USB stick itself is never offered)"
+
+say "" "Install Bluefin Server${version:+ ${version}} to which disk?" \
+    "The installer erases the chosen disk completely; it asks once more before it starts." ""
+for i in "${!nodes[@]}"; do
+    printf '  %d) %-8s %-30.30s %s\n' $(( i + 1 )) "${sizes[i]}" "${models[i]}" "${nodes[i]#/dev/disk/by-id/}"
+done
+say ""
+if [ "${count}" = 1 ]; then
+    prompt="Disk number [1], or q to cancel: "
+else
+    prompt="Disk number (1-${count}), or q to cancel: "
+fi
+while :; do
+    printf '%s' "${prompt}"
+    IFS= read -r answer || { printf '\n'; cancel "no disk was chosen"; }
+    answer="${answer//[[:space:]]/}"
+    [ -n "${answer}" ] || [ "${count}" != 1 ] || answer=1
+    case "${answer}" in
+        q | Q | quit | cancel) cancel "no disk was chosen" ;;
+        '') ;;
+        *[!0-9]*) say "Not a disk number: ${answer}" ;;
+        *)
+            if [ "$(( 10#${answer} ))" -ge 1 ] && [ "$(( 10#${answer} ))" -le "${count}" ]; then
+                break
+            fi
+            say "There is no disk ${answer}." ;;
+    esac
+done
+
+i=$(( 10#${answer} - 1 ))
+printf 'BLUEFIN_INSTALL_TARGET=%s\n' "${nodes[i]}" > "${out}/sysinstall.env"
+log "chose ${nodes[i]} (${sizes[i]}, ${models[i]})"
+say "" "Disk ${answer}: ${nodes[i]} (${sizes[i]}, ${models[i]})." ""
+exit 0

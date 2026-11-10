@@ -1,0 +1,24 @@
+# Port 80 of the add-on host names answers with a redirect to https: their
+# routes take the https listener only, so a token or the Console's login
+# never crosses the LAN in cleartext. An ACME HTTP-01 solver's route (exact
+# path) still wins over it.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: http-to-https
+  namespace: envoy-gateway-system
+spec:
+  parentRefs:
+  - name: homelab
+    namespace: envoy-gateway-system
+    sectionName: http
+  hostnames:
+  - "argo.${HOMELAB_DOMAIN}"
+  - "mcp.${HOMELAB_DOMAIN}"
+  - "kubestellar.${HOMELAB_DOMAIN}"
+  rules:
+  - filters:
+    - type: RequestRedirect
+      requestRedirect:
+        scheme: https
+        statusCode: 301

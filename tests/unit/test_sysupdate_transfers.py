@@ -13,8 +13,9 @@ These tests assert the drift-prone contracts:
 * every source ``MatchPattern`` corresponds to an artifact name that some
   element under ``elements/`` actually emits (``bluefin-server-ddi-<v>.raw.zst``,
   ``bluefin-server-<v>.efi``, ``k0s-<v>.raw.zst``)
-* the k0s sysext transfer lands in ``/var/lib/extensions`` under a name that
-  ``files/k0s/sysext/extension-release.k0s`` (``NAME=k0s``) can merge
+* each component sysext on its own version axis (k0s, the NVIDIA Container
+  Toolkit) is staged outside ``/var/lib/extensions`` behind a stable
+  ``CurrentSymlink`` whose name its ``extension-release`` (``ID=_any``) merges
 """
 
 import configparser
@@ -26,21 +27,43 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SYSUPDATE_DIR = REPO_ROOT / "files" / "os" / "sysupdate.d"
 K0S_SYSUPDATE_DIR = REPO_ROOT / "files" / "os" / "sysupdate.k0s.d"
-K0S_TRANSFER = K0S_SYSUPDATE_DIR / "70-k0s.transfer"
+CTK_SYSUPDATE_DIR = REPO_ROOT / "files" / "os" / "sysupdate.nvidia-container-toolkit.d"
 ELEMENTS_DIR = REPO_ROOT / "elements"
-EXTENSION_RELEASE = REPO_ROOT / "files" / "k0s" / "sysext" / "extension-release.k0s"
+
+# Sysexts on their own version axis: one sysupdate component each, staged in
+# a state directory and merged through a stable symlink by an opt-in unit.
+COMPONENTS = {
+    "k0s": {
+        "transfer": K0S_SYSUPDATE_DIR / "70-k0s.transfer",
+        "state": "/var/lib/k0s",
+        "release": REPO_ROOT / "files" / "k0s" / "sysext" / "extension-release.k0s",
+    },
+    "nvidia-container-toolkit": {
+        "transfer": CTK_SYSUPDATE_DIR / "71-nvidia-container-toolkit.transfer",
+        "state": "/var/lib/nvidia-container-toolkit",
+        "release": REPO_ROOT
+        / "files"
+        / "nvidia-container-toolkit"
+        / "sysext"
+        / "extension-release.nvidia-container-toolkit",
+    },
+}
 
 RELEASE_FEED = "https://github.com/projectbluefin/server/releases/latest/download/"
 
 
 def transfer_paths() -> list[Path]:
     return sorted(
-        (*SYSUPDATE_DIR.glob("*.transfer"), *K0S_SYSUPDATE_DIR.glob("*.transfer"))
+        (
+            *SYSUPDATE_DIR.glob("*.transfer"),
+            *K0S_SYSUPDATE_DIR.glob("*.transfer"),
+            *CTK_SYSUPDATE_DIR.glob("*.transfer"),
+        )
     )
 
 
 def load_transfer(path: Path) -> configparser.ConfigParser:
-    parser = configparser.ConfigParser(strict=False)
+    parser = configparser.ConfigParser(strict=False, interpolation=None)
     # systemd keys are case sensitive; configparser lowercases them by default.
     parser.optionxform = str
     parser.read_string(path.read_text())
@@ -48,10 +71,16 @@ def load_transfer(path: Path) -> configparser.ConfigParser:
 
 
 def element_texts() -> str:
-    """Every element definition concatenated, for artifact-name lookups."""
-    return "\n".join(
+    """Every element definition concatenated, for artifact-name lookups.
+
+    Sysext elements name their image in ``sysext-image:`` and
+    ``include/sysext.yml`` writes ``%{sysext-image}.raw``; spell that out.
+    """
+    text = "\n".join(
         p.read_text() for p in sorted(ELEMENTS_DIR.rglob("*.bst"))
     )
+    images = re.findall(r'^\s*sysext-image:\s*"([^"]+)"', text, re.MULTILINE)
+    return "\n".join([text, *(f"{image}.raw" for image in images)])
 
 
 def split_match_pattern(pattern: str) -> tuple[str, str]:
@@ -61,11 +90,6 @@ def split_match_pattern(pattern: str) -> tuple[str, str]:
     return prefix, suffix
 
 
-def test_sysupdate_directories_are_populated():
-    generic = sorted(p.name for p in SYSUPDATE_DIR.glob("*.transfer"))
-    k0s = sorted(p.name for p in K0S_SYSUPDATE_DIR.glob("*.transfer"))
-    assert generic == ["50-root.transfer", "60-uki.transfer"]
-    assert k0s == ["70-k0s.transfer"]
 
 
 @pytest.mark.parametrize("path", transfer_paths(), ids=lambda p: p.name)
@@ -120,15 +144,15 @@ def test_every_source_artifact_is_produced_by_an_element(path: Path):
 
     Renaming an artifact in ``elements/oci/*.bst`` without updating the matching
     transfer silently breaks OTA: sysupdate finds no candidate and reports the
-    system as up to date forever.
+    system as up to date forever. ``@u`` (partition UUID) is filled in by the
+    element at build time, so only the literal text around it is checked.
     """
     prefix, suffix = split_match_pattern(
         load_transfer(path)["Source"]["MatchPattern"]
     )
-    # Elements name artifacts with a BuildStream variable in the version slot,
-    # e.g. FNAME="k0s-%{k0s-version}.raw" plus a .zst compression step.
+    tail = suffix.split("@u", 1)[-1].removesuffix(".zst")
     produced = re.compile(
-        re.escape(prefix) + r"%\{[a-z0-9-]+\}" + re.escape(suffix.removesuffix(".zst"))
+        re.escape(prefix) + r"%\{[a-z0-9-]+\}" + r"[^\n]*?" + re.escape(tail)
     )
     assert produced.search(element_texts()), (
         f"{path.name} expects release asset {prefix}<version>{suffix}, but no "
@@ -136,49 +160,67 @@ def test_every_source_artifact_is_produced_by_an_element(path: Path):
     )
 
 
-def test_uki_transfer_installs_into_the_esp_boot_directory():
-    target = load_transfer(SYSUPDATE_DIR / "60-uki.transfer")["Target"]
+def test_uki_transfer_installs_into_boot_efi_linux_with_boot_counting():
+    target = load_transfer(SYSUPDATE_DIR / "20-uki.transfer")["Target"]
+    assert target.get("Type") == "regular-file"
+    assert target.get("Path") == "/EFI/Linux"
+    assert target.get("PathRelativeTo") == "boot", (
+        "systemd-boot discovers Type #2 UKIs under $BOOT/EFI/Linux"
+    )
+    assert "+@l-@d" in target.get("MatchPattern", ""), "boot counting needs @l/@d"
+    assert target.get("TriesLeft") == "3"
+    assert "Mode" not in target, (
+        "a read-only mode sets the FAT read-only attribute and systemd-boot can "
+        "no longer rename the file to count boots"
+    )
+
+
+def test_uki_source_name_is_one_of_the_target_names():
+    parser = load_transfer(SYSUPDATE_DIR / "20-uki.transfer")
+    source = parser["Source"]["MatchPattern"]
+    assert source in parser["Target"]["MatchPattern"].split(), (
+        "sysupdate correlates installed and available UKIs by name"
+    )
+    assert source.startswith("bluefin-server-"), (
+        "bootctl writes 'default bluefin-server-*' to loader.conf; an updated UKI "
+        "outside that glob would never become the default entry"
+    )
+
+
+@pytest.mark.parametrize("name", ["10-usr.transfer", "11-usr-verity.transfer"])
+def test_usr_transfers_carry_the_verity_partition_uuid(name: str):
+    source = load_transfer(SYSUPDATE_DIR / name)["Source"]["MatchPattern"]
+    assert "@u" in source, (
+        "the partition UUID must come from the asset name: dm-verity finds usr "
+        "partitions by UUIDs derived from usrhash"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(COMPONENTS))
+def test_component_sysext_transfer_stages_outside_the_extension_directories(name: str):
+    component = COMPONENTS[name]
+    target = load_transfer(component["transfer"])["Target"]
     assert target.get("Type") == "regular-file", (
-        "the UKI is a regular-file drop-in, not a partition or directory"
+        f"the {name} sysext is delivered as a decompressed regular file"
     )
-    assert target.get("Path") == "/efi/EFI/Linux", (
-        f"UKI target path is {target.get('Path')!r}; systemd-boot only discovers "
-        "unified kernels under the ESP's EFI/Linux directory"
-    )
-    assert target.get("MatchPattern", "").endswith(".efi"), (
-        "the installed UKI must keep its .efi extension to be bootable"
-    )
-
-
-def test_uki_source_and_target_names_agree():
-    parser = load_transfer(SYSUPDATE_DIR / "60-uki.transfer")
-    assert parser["Source"]["MatchPattern"] == parser["Target"]["MatchPattern"], (
-        "the UKI is copied verbatim; a source/target name mismatch would leave "
-        "sysupdate unable to correlate installed and available versions"
-    )
-
-
-def test_k0s_sysext_transfer_lands_in_the_system_extension_directory():
-    target = load_transfer(K0S_TRANSFER)["Target"]
-    assert target.get("Type") == "regular-file", (
-        "the k0s sysext is delivered as a decompressed regular file"
-    )
-    assert target.get("Path") == "/var/lib/k0s", (
-        f"k0s sysext target path is {target.get('Path')!r}; the persistent "
-        "staging path must remain outside systemd-sysext's early scan"
+    assert target.get("Path") == component["state"], (
+        f"{name} sysext target path is {target.get('Path')!r}; the persistent "
+        "staging path must remain outside systemd-sysext's early scan, where "
+        "two versions of an ID=_any image would both merge"
     )
     assert target.get("Mode") == "0644", (
-        f"k0s sysext mode is {target.get('Mode')!r}; the image must be readable "
+        f"{name} sysext mode is {target.get('Mode')!r}; the image must be readable "
         "by systemd-sysext at merge time"
     )
 
 
-def test_k0s_sysext_transfer_maintains_a_stable_current_symlink():
-    target = load_transfer(K0S_TRANSFER)["Target"]
+@pytest.mark.parametrize("name", sorted(COMPONENTS))
+def test_component_sysext_transfer_maintains_a_stable_current_symlink(name: str):
+    target = load_transfer(COMPONENTS[name]["transfer"])["Target"]
     symlink = target.get("CurrentSymlink")
-    assert symlink == "k0s.raw", (
+    assert symlink == f"{name}.raw", (
         f"CurrentSymlink is {symlink!r}; the boot activation unit requires a "
-        "stable filename, so a version bump otherwise stops merging k0s"
+        f"stable filename, so a version bump otherwise stops merging {name}"
     )
     prefix, suffix = split_match_pattern(target["MatchPattern"])
     assert symlink == f"{prefix.rstrip('-')}{suffix}", (
@@ -187,37 +229,37 @@ def test_k0s_sysext_transfer_maintains_a_stable_current_symlink():
     )
 
 
-def test_k0s_sysext_transfer_decompresses_the_release_asset():
-    parser = load_transfer(K0S_TRANSFER)
+@pytest.mark.parametrize("name", sorted(COMPONENTS))
+def test_component_sysext_transfer_decompresses_the_release_asset(name: str):
+    parser = load_transfer(COMPONENTS[name]["transfer"])
     source = parser["Source"]["MatchPattern"]
     target = parser["Target"]["MatchPattern"]
-    assert source.endswith(".raw.zst"), f"k0s release asset {source!r} is not zstd"
+    assert source.endswith(".raw.zst"), f"{name} release asset {source!r} is not zstd"
     assert target == source.removesuffix(".zst"), (
-        f"k0s sysext installs as {target!r} but downloads {source!r}; a still "
+        f"{name} sysext installs as {target!r} but downloads {source!r}; a still "
         "compressed image cannot be mounted by systemd-sysext"
     )
 
 
-def test_k0s_sysext_image_name_matches_its_extension_release_name():
+@pytest.mark.parametrize("name", sorted(COMPONENTS))
+def test_component_sysext_image_name_matches_its_extension_release_name(name: str):
     """systemd-sysext requires ``extension-release.<image-name>`` to agree.
 
-    The image installed by ``70-k0s.transfer`` is merged through the stable
-    ``k0s.raw`` symlink, so ``NAME=`` in ``files/k0s/sysext/extension-release.k0s``
-    must be ``k0s`` or the merge is rejected at boot.
+    The image a component transfer installs is merged through its stable
+    ``CurrentSymlink`` name, so ``NAME=`` in its ``extension-release`` must be
+    that name or the merge is rejected at boot.
     """
-    assert EXTENSION_RELEASE.is_file(), f"{EXTENSION_RELEASE} missing"
+    release = COMPONENTS[name]["release"]
+    assert release.is_file(), f"{release} missing"
     fields = dict(
         line.split("=", 1)
-        for line in EXTENSION_RELEASE.read_text().splitlines()
+        for line in release.read_text().splitlines()
         if "=" in line and not line.startswith("#")
     )
-    symlink = load_transfer(K0S_TRANSFER)["Target"][
-        "CurrentSymlink"
-    ]
+    symlink = load_transfer(COMPONENTS[name]["transfer"])["Target"]["CurrentSymlink"]
     image_name = symlink.removesuffix(".raw")
-    assert EXTENSION_RELEASE.name == f"extension-release.{image_name}", (
-        f"{EXTENSION_RELEASE.name} does not match the installed image name "
-        f"{image_name!r}"
+    assert release.name == f"extension-release.{image_name}", (
+        f"{release.name} does not match the installed image name {image_name!r}"
     )
     assert fields.get("NAME") == image_name, (
         f"extension-release NAME={fields.get('NAME')!r} but the sysext is merged "
@@ -229,21 +271,43 @@ def test_k0s_sysext_image_name_matches_its_extension_release_name():
     )
 
 
+@pytest.mark.parametrize("name", sorted(COMPONENTS))
+def test_component_transfer_carries_no_feature_or_version_protection(name: str):
+    """Components are opted into by enabling their activation unit, not by a
+    feature, and are not tied to the booted image version."""
+    transfer = load_transfer(COMPONENTS[name]["transfer"])["Transfer"]
+    assert "Features" not in transfer and "ProtectVersion" not in transfer
+
+
+IMAGE_ELEMENT = ELEMENTS_DIR / "oci" / "bluefin-server-image.bst"
+
+
 @pytest.mark.parametrize("path", transfer_paths(), ids=lambda p: p.name)
-def test_every_source_artifact_is_staged_in_release_workflow(path: Path):
-    """The release asset a transfer downloads must be staged into dist/release/ by build.yml."""
-    prefix, _ = split_match_pattern(
-        load_transfer(path)["Source"]["MatchPattern"]
-    )
+def test_every_source_artifact_is_in_the_signed_image_set(path: Path):
+    """The asset a transfer downloads must be in the image set, whose signed
+    SHA256SUMS the release publishes as-is (dist/diskless/)."""
+    prefix, _ = split_match_pattern(load_transfer(path)["Source"]["MatchPattern"])
+    image = IMAGE_ELEMENT.read_text()
+    assert prefix in image, f"{path.name}: {prefix!r} assets are not in {IMAGE_ELEMENT.name}"
     build_yml = (REPO_ROOT / ".github" / "workflows" / "build.yml").read_text()
-    assert re.search(rf"cp\s+.*{re.escape(prefix)}\*.*dist/release/", build_yml), (
-        f"{path.name} source asset prefix {prefix!r} is not staged to dist/release/ in .github/workflows/build.yml"
-    )
+    assert "scripts/publish-release.sh release dist/diskless" in build_yml
+    publish = (REPO_ROOT / "scripts" / "publish-release.sh").read_text()
+    assert "-maxdepth 1 -type f" in publish
+    assert "gpg --batch --yes --pinentry-mode loopback" in image
+    assert "gpgv --keyring /boot-keys/import-pubring.pgp SHA256SUMS.gpg SHA256SUMS" in image
 
 
 def test_k0s_release_staging_does_not_use_legacy_k3s_name() -> None:
-    build_yml = (REPO_ROOT / ".github" / "workflows" / "build.yml").read_text()
-    assert re.search(r"cp\s+.*k0s-\*\.raw\.zst.*dist/release/", build_yml)
-    assert not re.search(
-        r"cp\s+.*k3s-\*\.raw\.zst.*dist/release/", build_yml
-    )
+    image = IMAGE_ELEMENT.read_text()
+    assert "/sysext/k0s/k0s-*.raw.zst" in image
+    assert "k3s-" not in image
+
+
+def test_component_sysexts_are_staged_into_the_signed_image_set() -> None:
+    image = IMAGE_ELEMENT.read_text()
+    publish = (REPO_ROOT / "scripts" / "publish-release.sh").read_text()
+    for name in COMPONENTS:
+        assert f"filename: oci/{name}-sysext.bst" in image
+        assert f"/sysext/{name}/{name}-*.raw.zst" in image
+        # Own version axis: publish-release.sh accepts any version of it.
+        assert f'"{name}-[0-9][0-9A-Za-z.+-]*\\\\.raw\\\\.zst"' in publish
