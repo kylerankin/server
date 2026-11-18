@@ -51,13 +51,22 @@ trim() {
     printf '%s' "${v%"${v##*[![:space:]]}"}"
 }
 
+# A real SHA256SUMS manifest has at least one "<64-hex> *<file>" line. A 200
+# response whose body is not a manifest -- an HTML error page, a redirect
+# landing page, an empty body -- is not a manifest; treat it as a fetch
+# failure so the feature is left alone rather than wrongly archived.
+looks_like_manifest() {
+    printf '%s\n' "$1" | grep -Eq '^[0-9a-f]{64}[[:space:]]'
+}
 # Fetch (once per URL) the SHA256SUMS next to a transfer's Source Path.
-# Prints the manifest; returns 1 when it cannot be read.
+# Prints the manifest; returns 1 when it cannot be read or is not a manifest.
 fetch_manifest() {
     local url="${1%/}/SHA256SUMS"
     if [ -z "${manifest_cache[$url]+x}" ]; then
-        if manifest_cache[$url]="$(curl -fsSL --max-time "$fetch_timeout" -- "$url" 2>/dev/null)"; then
-            :
+        local body
+        if body="$(curl -fsSL --max-time "$fetch_timeout" -- "$url" 2>/dev/null)" \
+            && looks_like_manifest "$body"; then
+            manifest_cache[$url]="$body"
         else
             manifest_cache[$url]="__FETCH_FAILED__"
         fi

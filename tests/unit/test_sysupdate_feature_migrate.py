@@ -12,7 +12,8 @@ These tests pin the shipped fix:
 * the ``bluefin-sysupdate-migrate`` helper exists, is executable, and lives at
   ``/usr/bin/bluefin-sysupdate-migrate`` in the image
 * the one-shot unit runs ahead of the update path (before the timer and the
-  update unit itself) and is enabled by preset
+  update unit itself) and is shipped via the /usr link so updated nodes run it
+  even after first boot
 * the ``systemd-sysupdate.service`` drop-in runs the helper as
   ``ExecStartPre`` so every update -- timer- or hand-triggered -- is covered
 * the helper archives an enabled feature the release no longer ships, keeps a
@@ -23,8 +24,6 @@ These tests pin the shipped fix:
 import os
 import subprocess
 from pathlib import Path
-
-import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "files" / "os" / "sysupdate-migrate" / "bluefin-sysupdate-migrate"
@@ -168,6 +167,21 @@ def test_unreachable_manifest_leaves_features_alone(tmp_path: Path) -> None:
     result = run_helper(etc, lib)
     assert result.returncode == 0, result.stderr
     assert (etc / "homebrew.feature.d").is_dir(), "offline must never archive"
+
+
+def test_non_manifest_200_leaves_features_alone(tmp_path: Path) -> None:
+    # A 200 whose body is not a SHA256SUMS manifest -- an HTML error page, a
+    # redirect landing page, an empty body -- is not a manifest. An offline or
+    # misbehaving remote must never archive a working feature.
+    etc, lib = _make_tree(
+        tmp_path, remote=[], local={"homebrew": "homebrew_@v.raw.zst"}, enabled=["homebrew"]
+    )
+    (tmp_path / "release" / "SHA256SUMS").write_text(
+        "<html>not a manifest</html>\n", encoding="utf-8"
+    )
+    result = run_helper(etc, lib)
+    assert result.returncode == 0, result.stderr
+    assert (etc / "homebrew.feature.d").is_dir(), "non-manifest 200 must never archive"
 
 
 def test_helper_is_idempotent_on_rerun(tmp_path: Path) -> None:

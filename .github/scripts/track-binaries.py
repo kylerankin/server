@@ -93,7 +93,6 @@ not fail the run; a 4xx fails at once.
 
 Stdlib only. GITHUB_TOKEN or GH_TOKEN, if set, is sent to api.github.com only.
 """
-from __future__ import annotations
 
 import argparse
 import hashlib
@@ -200,7 +199,7 @@ class Tree:
         self[path]
         self._text[path] = text
 
-    def copy(self) -> Tree:
+    def copy(self) -> 'Tree':
         other = Tree(self.root)
         other._text = dict(self._text)
         other._original = dict(self._original)
@@ -411,7 +410,7 @@ class Component:
     # What a pin holds, for the pull request body.
     pin_label = "sha256"
 
-    def verify(self, tree: Tree) -> list[Change]:
+    def verify(self, tree: Tree) -> 'list[Change]':
         """Read each pin of the version `tree` is set to from upstream, confirm it and write it to `tree`.
 
         The sha256 comes from the checksum file the project publishes next to
@@ -432,7 +431,7 @@ class Component:
             write_pin(tree, pin, sha)
         return changes
 
-    def evidence(self, result: Result) -> list[str]:
+    def evidence(self, result: 'Result') -> list[str]:
         return [
             "Every sha256 comes from the checksum file upstream publishes next to the",
             "asset, and matched the sha256 of the downloaded asset:",
@@ -624,7 +623,7 @@ class GitTagComponent(Component):
         api = f"https://api.github.com/repos/{self.repo}/commits/refs/tags/{tag}"
         return [Pin(self.include, "", self.commit_variable, self.git_url, api, standalone_key=True)]
 
-    def verify(self, tree: Tree) -> list[Change]:
+    def verify(self, tree: Tree) -> 'list[Change]':
         (pin,) = self.pins(tree)
         tag = f"v{self.current(tree)}"
         from_api = json.loads(_get(pin.sums)).get("sha", "")
@@ -637,7 +636,7 @@ class GitTagComponent(Component):
         write_pin(tree, pin, from_api)
         return [change]
 
-    def evidence(self, result: Result) -> list[str]:
+    def evidence(self, result: 'Result') -> list[str]:
         tag = f"refs/tags/v{result.new}"
         lines = ["The commit is the one two upstream answers agree on for the tag:", ""]
         for pin, _, _ in result.changes:
@@ -780,7 +779,7 @@ class OrasComponent(Component):
             for path, url in sorted({(path, m[0]) for path, m in urls})
         ]
 
-    def verify(self, tree: Tree) -> list[Change]:
+    def verify(self, tree: Tree) -> 'list[Change]':
         """The setup-oras checksums, then the Justfile image's digest for the new tag.
 
         The digest is the sha256 of the index manifest bytes ghcr.io serves for
@@ -807,7 +806,7 @@ class OrasComponent(Component):
         pin = Pin("Justfile", "", "oras_image", url, url)
         return [*changes, Change(pin, before.removeprefix("sha256:"), digest.removeprefix("sha256:"))]
 
-    def evidence(self, result: Result) -> list[str]:
+    def evidence(self, result: 'Result') -> list[str]:
         image = [c for c in result.changes if c.pin.path == "Justfile"]
         return [
             *super().evidence(Result(result.component, result.old, result.new,
